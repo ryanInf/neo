@@ -1,9 +1,20 @@
 // 技能定义相关的类型定义
 
+/**
+ * 参数映射规则
+ * 支持不同类型的参数映射：query（查询参数）、path（路径参数）、header（请求头）、body（请求体）
+ */
+export interface InputMapping {
+  query?: Record<string, string>;   // 查询参数映射
+  path?: Record<string, string>;     // 路径参数映射
+  header?: Record<string, string>;  // 请求头映射
+  body?: Record<string, string>;    // 请求体映射
+}
+
 export interface ApiCall {
   apiDocId: string;
   order: number;
-  inputMapping?: Record<string, string>;  // 参数映射规则
+  inputMapping?: InputMapping | Record<string, string>;  // 参数映射规则（支持新旧两种格式）
   outputMapping?: Record<string, string>; // 输出映射规则
   condition?: string;                      // 执行条件（可选）
   loopType?: 'for' | 'while' | 'forEach'; // 循环类型（用于迭代式编排）
