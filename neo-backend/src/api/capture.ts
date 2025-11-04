@@ -1,9 +1,9 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../utils/prisma';
 import { generateRequestHash } from '../utils/hash';
+import { ValidationError, DatabaseError } from '../utils/errors';
+import { validateArray, validateRequired, validateUrl, validateHttpMethod } from '../utils/validation';
 import type { ApiCaptureRequest } from '../models/types';
-
-const prisma = new PrismaClient();
 
 /**
  * 接收插件上报的 API 调用数据
@@ -13,15 +13,20 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
   try {
     const { captures } = req.body as ApiCaptureRequest;
     
-    if (!captures || !Array.isArray(captures)) {
-      res.status(400).json({ error: 'Invalid request body' });
-      return;
-    }
+    // 输入验证
+    validateArray(captures, 'captures');
     
     const results = [];
     
     for (const capture of captures) {
       try {
+        // 验证必填字段
+        validateRequired(capture.url, 'url');
+        validateRequired(capture.method, 'method');
+        validateRequired(capture.domain, 'domain');
+        validateUrl(capture.url, 'url');
+        validateHttpMethod(capture.method, 'method');
+        
         // 生成请求哈希用于去重
         const requestHash = generateRequestHash(
           capture.url,
@@ -59,9 +64,9 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
               url: capture.url,
               method: capture.method,
               domain: capture.domain,
-              requestHeaders: capture.requestHeaders,
+              requestHeaders: capture.requestHeaders || {},
               requestBody: capture.requestBody,
-              responseHeaders: capture.responseHeaders,
+              responseHeaders: capture.responseHeaders || {},
               responseBody: capture.responseBody,
               statusCode: capture.statusCode,
               requestHash,
@@ -70,8 +75,12 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
           results.push({ id: apiDoc.id, action: 'created' });
         }
       } catch (error) {
-        console.error('Error processing capture:', error);
-        results.push({ error: 'Failed to process capture' });
+        if (error instanceof ValidationError) {
+          results.push({ error: error.message });
+        } else {
+          console.error('Error processing capture:', error);
+          results.push({ error: 'Failed to process capture' });
+        }
       }
     }
     
@@ -81,8 +90,7 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
       results,
     });
   } catch (error) {
-    console.error('Error in captureApi:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 

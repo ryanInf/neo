@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../utils/prisma';
 import { analyzeApiDoc, analyzePendingApiDocs } from '../services/api-analysis.service';
-
-const prisma = new PrismaClient();
+import { ValidationError, NotFoundError } from '../utils/errors';
+import { validateRequired, validateNumberRange } from '../utils/validation';
 
 /**
  * 查询 API 文档列表
@@ -12,7 +12,7 @@ export async function getApiDocs(req: Request, res: Response): Promise<void> {
   try {
     const { domain, method, limit = 50, offset = 0 } = req.query;
     
-    const where: any = {};
+    const where: Record<string, any> = {};
     
     if (domain) {
       where.domain = domain as string;
@@ -22,11 +22,18 @@ export async function getApiDocs(req: Request, res: Response): Promise<void> {
       where.method = (method as string).toUpperCase();
     }
     
+    const limitNum = Number(limit);
+    const offsetNum = Number(offset);
+    
+    // 验证分页参数
+    validateNumberRange(limitNum, 'limit', 1, 100);
+    validateNumberRange(offsetNum, 'offset', 0);
+    
     const [docs, total] = await Promise.all([
       prisma.apiDoc.findMany({
         where,
-        take: Number(limit),
-        skip: Number(offset),
+        take: limitNum,
+        skip: offsetNum,
         orderBy: {
           createdAt: 'desc',
         },
@@ -38,12 +45,11 @@ export async function getApiDocs(req: Request, res: Response): Promise<void> {
       success: true,
       data: docs,
       total,
-      limit: Number(limit),
-      offset: Number(offset),
+      limit: limitNum,
+      offset: offsetNum,
     });
   } catch (error) {
-    console.error('Error fetching API docs:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -54,14 +60,14 @@ export async function getApiDocs(req: Request, res: Response): Promise<void> {
 export async function getApiDocById(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
+    validateRequired(id, 'id');
     
     const doc = await prisma.apiDoc.findUnique({
       where: { id },
     });
     
     if (!doc) {
-      res.status(404).json({ error: 'API doc not found' });
-      return;
+      throw new NotFoundError('API doc', id);
     }
     
     res.json({
@@ -69,8 +75,7 @@ export async function getApiDocById(req: Request, res: Response): Promise<void> 
       data: doc,
     });
   } catch (error) {
-    console.error('Error fetching API doc:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -81,6 +86,7 @@ export async function getApiDocById(req: Request, res: Response): Promise<void> 
 export async function analyzeApiDocById(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
+    validateRequired(id, 'id');
     
     // 异步分析，不阻塞响应
     analyzeApiDoc(id).catch(error => {
@@ -92,8 +98,7 @@ export async function analyzeApiDocById(req: Request, res: Response): Promise<vo
       message: 'Analysis started',
     });
   } catch (error) {
-    console.error('Error starting analysis:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -105,8 +110,11 @@ export async function analyzePendingDocs(req: Request, res: Response): Promise<v
   try {
     const { limit = 10 } = req.body;
     
+    const limitNum = Number(limit);
+    validateNumberRange(limitNum, 'limit', 1, 50);
+    
     // 异步分析，不阻塞响应
-    analyzePendingApiDocs(Number(limit)).catch(error => {
+    analyzePendingApiDocs(limitNum).catch(error => {
       console.error('Error analyzing pending docs:', error);
     });
     
@@ -115,8 +123,7 @@ export async function analyzePendingDocs(req: Request, res: Response): Promise<v
       message: 'Batch analysis started',
     });
   } catch (error) {
-    console.error('Error starting batch analysis:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
