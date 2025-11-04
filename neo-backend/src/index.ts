@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { captureApi } from './api/capture';
 import { getApiDocs, getApiDocById, analyzeApiDocById, analyzePendingDocs } from './api/docs';
-import { createSkill, getSkills, getSkillById, downloadSkill } from './api/skills';
+import { createSkill, getSkills, getSkillById, downloadSkill, checkSkillUpdates } from './api/skills';
 import { receiveLogs } from './api/logs';
 import { optimizeSkillById, optimizeAllSkills } from './api/skill-optimize';
 
@@ -31,6 +31,7 @@ app.post('/api/skills', createSkill);
 app.get('/api/skills', getSkills);
 app.get('/api/skills/:id', getSkillById);
 app.get('/api/skills/:id/download', downloadSkill);
+app.post('/api/skills/check-updates', checkSkillUpdates);
 app.post('/api/skills/:id/optimize', optimizeSkillById);
 app.post('/api/skills/optimize', optimizeAllSkills);
 app.post('/api/logs', receiveLogs);

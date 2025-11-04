@@ -139,3 +139,80 @@ export async function getSkill(skillId: string): Promise<string> {
   return code;
 }
 
+/**
+ * 批量检查技能更新
+ */
+export async function checkSkillUpdatesBatch(
+  skillVersions: Array<{ id: string; version: number }>
+): Promise<Array<{ id: string; hasUpdate: boolean; latestVersion?: number; name?: string }>> {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/skills/check-updates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ skillIds: skillVersions }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to check updates: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.data || [];
+  } catch (error) {
+    console.error('[Neo] Error checking skill updates:', error);
+    return [];
+  }
+}
+
+/**
+ * 获取所有已安装的技能列表（从缓存中）
+ */
+export async function getInstalledSkills(): Promise<Array<{ id: string; version: number }>> {
+  try {
+    const allItems = await chrome.storage.local.get(null);
+    const installedSkills: Array<{ id: string; version: number }> = [];
+
+    for (const [key, value] of Object.entries(allItems)) {
+      if (key.startsWith('skill_')) {
+        const skillId = key.replace('skill_', '');
+        const cached = value as { code: string; version: number; cachedAt: number };
+        installedSkills.push({
+          id: skillId,
+          version: cached.version,
+        });
+      }
+    }
+
+    return installedSkills;
+  } catch (error) {
+    console.error('[Neo] Error getting installed skills:', error);
+    return [];
+  }
+}
+
+/**
+ * 更新技能到最新版本
+ */
+export async function updateSkill(skillId: string): Promise<boolean> {
+  try {
+    // 下载最新版本
+    const code = await downloadSkill(skillId);
+    
+    // 获取版本信息
+    const response = await fetch(`${BACKEND_URL}/api/skills/${skillId}`);
+    if (response.ok) {
+      const data = await response.json();
+      const version = data.data?.version || 1;
+      await cacheSkill(skillId, code, version);
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error(`[Neo] Error updating skill ${skillId}:`, error);
+    return false;
+  }
+}
+

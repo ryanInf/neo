@@ -178,3 +178,91 @@ export async function downloadSkill(req: Request, res: Response): Promise<void> 
   }
 }
 
+/**
+ * 批量检查技能更新
+ * POST /api/skills/check-updates
+ * Body: { skillIds: string[] } - 技能ID数组，每个元素格式为 { id: string, version: number }
+ */
+export async function checkSkillUpdates(req: Request, res: Response): Promise<void> {
+  try {
+    const { skillIds } = req.body;
+
+    if (!skillIds || !Array.isArray(skillIds)) {
+      res.status(400).json({ error: 'Invalid request body: skillIds must be an array' });
+      return;
+    }
+
+    // 提取所有技能ID
+    const ids = skillIds.map((item: any) => 
+      typeof item === 'string' ? item : item.id
+    );
+
+    if (ids.length === 0) {
+      res.json({
+        success: true,
+        data: [],
+      });
+      return;
+    }
+
+    // 查询所有技能的最新版本
+    const skills = await prisma.skill.findMany({
+      where: {
+        id: { in: ids },
+      },
+      select: {
+        id: true,
+        version: true,
+        name: true,
+      },
+    });
+
+    // 创建技能ID到版本的映射
+    const skillMap = new Map(skills.map(s => [s.id, s]));
+
+    // 构建更新列表
+    const updates: Array<{
+      id: string;
+      hasUpdate: boolean;
+      currentVersion?: number;
+      latestVersion?: number;
+      name?: string;
+    }> = [];
+
+    for (const item of skillIds) {
+      const skillId = typeof item === 'string' ? item : item.id;
+      const currentVersion = typeof item === 'object' && item.version 
+        ? item.version 
+        : undefined;
+
+      const skill = skillMap.get(skillId);
+      
+      if (skill) {
+        const hasUpdate = currentVersion !== undefined && skill.version > currentVersion;
+        updates.push({
+          id: skillId,
+          hasUpdate,
+          currentVersion,
+          latestVersion: skill.version,
+          name: skill.name,
+        });
+      } else {
+        // 技能不存在，标记为需要更新
+        updates.push({
+          id: skillId,
+          hasUpdate: false,
+          currentVersion,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: updates,
+    });
+  } catch (error) {
+    console.error('Error checking skill updates:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
