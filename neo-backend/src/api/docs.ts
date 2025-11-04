@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { analyzeApiDoc, analyzePendingApiDocs } from '../services/api-analysis.service';
+import { apiAnalysisQueue } from '../queues';
 
 const prisma = new PrismaClient();
 
@@ -82,14 +82,13 @@ export async function analyzeApiDocById(req: Request, res: Response): Promise<vo
   try {
     const { id } = req.params;
     
-    // 异步分析，不阻塞响应
-    analyzeApiDoc(id).catch(error => {
-      console.error(`Error analyzing doc ${id}:`, error);
-    });
+    // 将任务加入队列，不阻塞响应
+    const job = await apiAnalysisQueue.add('analyze-single', { apiDocId: id });
     
     res.json({
       success: true,
       message: 'Analysis started',
+      jobId: job.id,
     });
   } catch (error) {
     console.error('Error starting analysis:', error);
@@ -105,14 +104,13 @@ export async function analyzePendingDocs(req: Request, res: Response): Promise<v
   try {
     const { limit = 10 } = req.body;
     
-    // 异步分析，不阻塞响应
-    analyzePendingApiDocs(Number(limit)).catch(error => {
-      console.error('Error analyzing pending docs:', error);
-    });
+    // 将任务加入队列，不阻塞响应
+    const job = await apiAnalysisQueue.add('analyze-batch', { limit: Number(limit) });
     
     res.json({
       success: true,
       message: 'Batch analysis started',
+      jobId: job.id,
     });
   } catch (error) {
     console.error('Error starting batch analysis:', error);

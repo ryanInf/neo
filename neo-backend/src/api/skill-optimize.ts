@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { optimizeSkill, optimizeSkills } from '../services/skill-optimization.service';
+import { skillOptimizationQueue } from '../queues';
 
 /**
  * 优化单个技能
@@ -9,14 +9,13 @@ export async function optimizeSkillById(req: Request, res: Response): Promise<vo
   try {
     const { id } = req.params;
     
-    // 异步优化，不阻塞响应
-    optimizeSkill(id).catch(error => {
-      console.error(`Error optimizing skill ${id}:`, error);
-    });
+    // 将任务加入队列，不阻塞响应
+    const job = await skillOptimizationQueue.add('optimize-single', { skillId: id });
     
     res.json({
       success: true,
       message: 'Optimization started',
+      jobId: job.id,
     });
   } catch (error) {
     console.error('Error starting optimization:', error);
@@ -32,14 +31,13 @@ export async function optimizeAllSkills(req: Request, res: Response): Promise<vo
   try {
     const { limit = 10 } = req.body;
     
-    // 异步优化，不阻塞响应
-    optimizeSkills(Number(limit)).catch(error => {
-      console.error('Error optimizing skills:', error);
-    });
+    // 将任务加入队列，不阻塞响应
+    const job = await skillOptimizationQueue.add('optimize-batch', { limit: Number(limit) });
     
     res.json({
       success: true,
       message: 'Batch optimization started',
+      jobId: job.id,
     });
   } catch (error) {
     console.error('Error starting batch optimization:', error);

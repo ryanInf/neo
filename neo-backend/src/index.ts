@@ -6,6 +6,8 @@ import { getApiDocs, getApiDocById, analyzeApiDocById, analyzePendingDocs } from
 import { createSkill, getSkills, getSkillById, downloadSkill, checkSkillUpdates } from './api/skills';
 import { receiveLogs } from './api/logs';
 import { optimizeSkillById, optimizeAllSkills } from './api/skill-optimize';
+import { initializeQueueEvents, closeQueues } from './queues';
+import { startAllWorkers } from './workers';
 
 dotenv.config();
 
@@ -73,8 +75,31 @@ app.post('/api/skills/:id/optimize', optimizeSkillById);
 app.post('/api/skills/optimize', optimizeAllSkills);
 app.post('/api/logs', receiveLogs);
 
+// 初始化队列系统和处理器
+initializeQueueEvents();
+startAllWorkers();
+
 // 启动服务器
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[Neo Backend] Server running on port ${PORT}`);
+});
+
+// 优雅关闭处理
+process.on('SIGTERM', async () => {
+  console.log('[Neo Backend] SIGTERM received, shutting down gracefully...');
+  await closeQueues();
+  server.close(() => {
+    console.log('[Neo Backend] Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', async () => {
+  console.log('[Neo Backend] SIGINT received, shutting down gracefully...');
+  await closeQueues();
+  server.close(() => {
+    console.log('[Neo Backend] Server closed');
+    process.exit(0);
+  });
 });
 
