@@ -1,14 +1,14 @@
 import OpenAI from 'openai';
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../utils/prisma';
+import { config } from '../utils/config';
+import { NotFoundError, ExternalApiError } from '../utils/errors';
 import type { ApiCall } from '../models/skill-types';
 
 // SiliconFlow API 配置
 const openai = new OpenAI({
-  apiKey: process.env.SILICONFLOW_API_KEY!,
-  baseURL: 'https://api.siliconflow.cn/v1',
+  apiKey: config.siliconFlowApiKey,
+  baseURL: config.siliconFlowBaseUrl,
 });
-
-const prisma = new PrismaClient();
 
 /**
  * 生成技能编排的 Prompt
@@ -105,7 +105,7 @@ export async function orchestrateSkill(
     });
 
     if (apiDocs.length === 0) {
-      throw new Error('No API docs found');
+      throw new NotFoundError('API docs', `domain: ${domain}`);
     }
 
     const prompt = generateOrchestrationPrompt(apiDocs);
@@ -129,16 +129,21 @@ export async function orchestrateSkill(
     const responseText = completion.choices[0]?.message?.content || '';
     
     if (!responseText) {
-      throw new Error('Empty response from OpenAI');
+      throw new ExternalApiError('Empty response from OpenAI');
     }
 
     // 解析 JSON 响应
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      throw new Error('Invalid JSON response from OpenAI');
+      throw new ExternalApiError('Invalid JSON response from OpenAI');
     }
 
-    const skillData = JSON.parse(jsonMatch[0]);
+    let skillData;
+    try {
+      skillData = JSON.parse(jsonMatch[0]);
+    } catch (error) {
+      throw new ExternalApiError('Failed to parse JSON response from OpenAI', { error });
+    }
     
     return {
       name: skillData.name || '未命名技能',
@@ -146,7 +151,10 @@ export async function orchestrateSkill(
       apiSequence: skillData.apiSequence || [],
     };
   } catch (error) {
+    if (error instanceof NotFoundError || error instanceof ExternalApiError) {
+      throw error;
+    }
     console.error('Error orchestrating skill:', error);
-    throw error;
+    throw new ExternalApiError('Failed to orchestrate skill', { originalError: error });
   }
 }

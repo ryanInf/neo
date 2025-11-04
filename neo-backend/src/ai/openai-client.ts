@@ -1,9 +1,11 @@
 import OpenAI from 'openai';
+import { config } from '../utils/config';
+import { ExternalApiError } from '../utils/errors';
 
 // SiliconFlow API 配置
 const openai = new OpenAI({
-  apiKey: process.env.SILICONFLOW_API_KEY!,
-  baseURL: 'https://api.siliconflow.cn/v1',
+  apiKey: config.siliconFlowApiKey,
+  baseURL: config.siliconFlowBaseUrl,
 });
 
 /**
@@ -112,13 +114,16 @@ export async function generateApiDoc(apiData: {
     const docMarkdown = completion.choices[0]?.message?.content || '';
     
     if (!docMarkdown) {
-      throw new Error('Empty response from OpenAI');
+      throw new ExternalApiError('Empty response from OpenAI');
     }
     
     return docMarkdown;
   } catch (error) {
+    if (error instanceof ExternalApiError) {
+      throw error;
+    }
     console.error('Error generating API doc:', error);
-    throw error;
+    throw new ExternalApiError('Failed to generate API doc', { originalError: error });
   }
 }
 
@@ -151,6 +156,6 @@ export async function generateApiDocWithRetry(
     }
   }
   
-  throw lastError || new Error('Failed to generate API doc after retries');
+  throw lastError || new ExternalApiError('Failed to generate API doc after retries');
 }
 

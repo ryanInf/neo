@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../utils/prisma';
+import { validateArray } from '../utils/validation';
 import type { ExecutionLog } from '../models/skill-types';
-
-const prisma = new PrismaClient();
 
 /**
  * 接收执行日志
@@ -12,10 +12,8 @@ export async function receiveLogs(req: Request, res: Response): Promise<void> {
   try {
     const { logs } = req.body as { logs: ExecutionLog[] };
     
-    if (!logs || !Array.isArray(logs)) {
-      res.status(400).json({ error: 'Invalid request body' });
-      return;
-    }
+    // 输入验证
+    validateArray(logs, 'logs');
     
     const results = [];
     
@@ -28,7 +26,7 @@ export async function receiveLogs(req: Request, res: Response): Promise<void> {
             domain: log.domain,
             timestamp: new Date(log.timestamp),
             status: log.status,
-            steps: log.steps as any,
+            steps: log.steps as unknown as Prisma.JsonValue,
             error: log.error,
           },
         });
@@ -46,8 +44,7 @@ export async function receiveLogs(req: Request, res: Response): Promise<void> {
       results,
     });
   } catch (error) {
-    console.error('Error in receiveLogs:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 

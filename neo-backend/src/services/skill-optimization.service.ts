@@ -1,15 +1,16 @@
 import OpenAI from 'openai';
-import { PrismaClient } from '@prisma/client';
-import type { ApiCall } from '../models/skill-types';
-import { generateSkillCode, createSkillDefinition, type ApiDocInfo } from '../services/skill-code-generator';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../utils/prisma';
+import { config } from '../utils/config';
+import { NotFoundError, ExternalApiError } from '../utils/errors';
+import type { ApiCall, SkillDefinition, ExecutionStep } from '../models/skill-types';
+import { generateSkillCode, createSkillDefinition, type ApiDocInfo } from './skill-code-generator';
 
 // SiliconFlow API 配置
 const openai = new OpenAI({
-  apiKey: process.env.SILICONFLOW_API_KEY!,
-  baseURL: 'https://api.siliconflow.cn/v1',
+  apiKey: config.siliconFlowApiKey,
+  baseURL: config.siliconFlowBaseUrl,
 });
-
-const prisma = new PrismaClient();
 
 /**
  * 分析执行日志并优化技能
@@ -21,7 +22,7 @@ export async function optimizeSkill(skillId: string): Promise<void> {
   });
 
   if (!skill) {
-    throw new Error(`Skill not found: ${skillId}`);
+    throw new NotFoundError('Skill', skillId);
   }
 
   // 获取最近的执行日志
@@ -51,15 +52,15 @@ export async function optimizeSkill(skillId: string): Promise<void> {
   }
 
   // 收集失败的步骤
-  const failedSteps: any[] = [];
+  const failedSteps: ExecutionStep[] = [];
   logs.forEach(log => {
     if (log.status === 'failed') {
-      const steps = log.steps as any[];
+      const steps = (log.steps as unknown as ExecutionStep[]) || [];
       steps.forEach(step => {
         if (step.status === 'failed') {
           failedSteps.push({
             ...step,
-            error: step.error || log.error,
+            error: step.error || log.error || undefined,
           });
         }
       });
@@ -67,7 +68,7 @@ export async function optimizeSkill(skillId: string): Promise<void> {
   });
 
   // 生成优化 Prompt
-  const definition = skill.definition as any;
+  const definition = skill.definition as unknown as SkillDefinition;
   const prompt = generateOptimizationPrompt(
     skill.name,
     skill.description,
@@ -98,16 +99,21 @@ export async function optimizeSkill(skillId: string): Promise<void> {
   const responseText = completion.choices[0]?.message?.content || '';
   
   if (!responseText) {
-    throw new Error('Empty response from OpenAI');
+    throw new ExternalApiError('Empty response from OpenAI');
   }
 
   // 解析优化后的技能定义
   const jsonMatch = responseText.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
-    throw new Error('Invalid JSON response from OpenAI');
+    throw new ExternalApiError('Invalid JSON response from OpenAI');
   }
 
-  const optimizedData = JSON.parse(jsonMatch[0]);
+  let optimizedData;
+  try {
+    optimizedData = JSON.parse(jsonMatch[0]);
+  } catch (error) {
+    throw new ExternalApiError('Failed to parse JSON response from OpenAI', { error });
+  }
   
   // 获取优化后的 API 序列
   const optimizedApiSequence = optimizedData.apiSequence || definition.apiSequence;
@@ -138,7 +144,7 @@ export async function optimizeSkill(skillId: string): Promise<void> {
   // 验证所有 ApiDoc 都已找到
   for (const apiCall of optimizedApiSequence) {
     if (!apiDocMap.has(apiCall.apiDocId)) {
-      throw new Error(`ApiDoc not found for id: ${apiCall.apiDocId}`);
+      throw new NotFoundError('ApiDoc', apiCall.apiDocId);
     }
   }
   
@@ -164,7 +170,7 @@ export async function optimizeSkill(skillId: string): Promise<void> {
       description: optimizedData.description || skill.description,
       domain: skill.domain,
       version: newVersion,
-      definition: newDefinition as any,
+      definition: newDefinition as unknown as Prisma.JsonValue,
     },
   });
 
@@ -178,8 +184,8 @@ function generateOptimizationPrompt(
   name: string,
   description: string,
   apiSequence: ApiCall[],
-  logs: any[],
-  failedSteps: any[],
+  logs: Array<{ status: string; timestamp: Date }>,
+  failedSteps: ExecutionStep[],
   successRate: number,
   failureRate: number
 ): string {

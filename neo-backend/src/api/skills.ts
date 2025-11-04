@@ -1,9 +1,10 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../utils/prisma';
 import { orchestrateSkill } from '../ai/skill-orchestration';
 import { generateSkillCode, createSkillDefinition, type ApiDocInfo } from '../services/skill-code-generator';
-
-const prisma = new PrismaClient();
+import { ValidationError, NotFoundError } from '../utils/errors';
+import { validateRequired, validateArray } from '../utils/validation';
 
 /**
  * 创建技能
@@ -13,10 +14,9 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
   try {
     const { domain, apiDocIds, name, description } = req.body;
 
-    if (!domain || !apiDocIds || !Array.isArray(apiDocIds) || apiDocIds.length === 0) {
-      res.status(400).json({ error: 'Invalid request body' });
-      return;
-    }
+    // 输入验证
+    validateRequired(domain, 'domain');
+    validateArray(apiDocIds, 'apiDocIds');
 
     // 使用 AI 编排技能
     const orchestration = await orchestrateSkill(domain, apiDocIds);
@@ -50,10 +50,7 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
     // 验证所有 ApiDoc 都已找到
     for (const apiCall of orchestration.apiSequence) {
       if (!apiDocMap.has(apiCall.apiDocId)) {
-        res.status(400).json({ 
-          error: `ApiDoc not found for id: ${apiCall.apiDocId}` 
-        });
-        return;
+        throw new NotFoundError('ApiDoc', apiCall.apiDocId);
       }
     }
 
@@ -70,7 +67,7 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
         description: finalDescription,
         domain,
         version: 1,
-        definition: definition as any,
+        definition: definition as unknown as Prisma.JsonValue,
       },
     });
 
@@ -79,8 +76,7 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
       data: skill,
     });
   } catch (error) {
-    console.error('Error creating skill:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -92,16 +88,27 @@ export async function getSkills(req: Request, res: Response): Promise<void> {
   try {
     const { domain, limit = 50, offset = 0 } = req.query;
 
-    const where: any = {};
+    const where: Record<string, any> = {};
     if (domain) {
       where.domain = domain as string;
+    }
+
+    const limitNum = Number(limit);
+    const offsetNum = Number(offset);
+    
+    // 验证分页参数
+    if (isNaN(limitNum) || limitNum < 1 || limitNum > 100) {
+      throw new ValidationError('limit must be between 1 and 100');
+    }
+    if (isNaN(offsetNum) || offsetNum < 0) {
+      throw new ValidationError('offset must be a non-negative number');
     }
 
     const [skills, total] = await Promise.all([
       prisma.skill.findMany({
         where,
-        take: Number(limit),
-        skip: Number(offset),
+        take: limitNum,
+        skip: offsetNum,
         orderBy: {
           createdAt: 'desc',
         },
@@ -113,12 +120,11 @@ export async function getSkills(req: Request, res: Response): Promise<void> {
       success: true,
       data: skills,
       total,
-      limit: Number(limit),
-      offset: Number(offset),
+      limit: limitNum,
+      offset: offsetNum,
     });
   } catch (error) {
-    console.error('Error fetching skills:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -129,14 +135,14 @@ export async function getSkills(req: Request, res: Response): Promise<void> {
 export async function getSkillById(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
+    validateRequired(id, 'id');
 
     const skill = await prisma.skill.findUnique({
       where: { id },
     });
 
     if (!skill) {
-      res.status(404).json({ error: 'Skill not found' });
-      return;
+      throw new NotFoundError('Skill', id);
     }
 
     res.json({
@@ -144,8 +150,7 @@ export async function getSkillById(req: Request, res: Response): Promise<void> {
       data: skill,
     });
   } catch (error) {
-    console.error('Error fetching skill:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 
@@ -156,25 +161,24 @@ export async function getSkillById(req: Request, res: Response): Promise<void> {
 export async function downloadSkill(req: Request, res: Response): Promise<void> {
   try {
     const { id } = req.params;
+    validateRequired(id, 'id');
 
     const skill = await prisma.skill.findUnique({
       where: { id },
     });
 
     if (!skill) {
-      res.status(404).json({ error: 'Skill not found' });
-      return;
+      throw new NotFoundError('Skill', id);
     }
 
-    const definition = skill.definition as any;
+    const definition = skill.definition as { content?: string };
     const code = definition.content || '';
 
     res.setHeader('Content-Type', 'application/javascript');
     res.setHeader('Content-Disposition', `attachment; filename="${skill.name}-v${skill.version}.js"`);
     res.send(code);
   } catch (error) {
-    console.error('Error downloading skill:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    throw error;
   }
 }
 

@@ -1,7 +1,6 @@
-import { PrismaClient } from '@prisma/client';
+import { prisma } from '../utils/prisma';
 import { generateApiDocWithRetry } from '../ai/openai-client';
-
-const prisma = new PrismaClient();
+import { NotFoundError, DatabaseError } from '../utils/errors';
 
 /**
  * 分析单个 API 文档并生成 Markdown
@@ -12,7 +11,7 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
   });
   
   if (!apiDoc) {
-    throw new Error(`API doc not found: ${apiDocId}`);
+    throw new NotFoundError('API doc', apiDocId);
   }
   
   // 如果已经有文档，跳过
@@ -26,10 +25,10 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
     const docMarkdown = await generateApiDocWithRetry({
       url: apiDoc.url,
       method: apiDoc.method,
-      requestHeaders: apiDoc.requestHeaders as Record<string, string>,
-      requestBody: apiDoc.requestBody as any,
-      responseHeaders: apiDoc.responseHeaders as Record<string, string>,
-      responseBody: apiDoc.responseBody as any,
+      requestHeaders: (apiDoc.requestHeaders as Record<string, string>) || {},
+      requestBody: apiDoc.requestBody as Record<string, any> | undefined,
+      responseHeaders: (apiDoc.responseHeaders as Record<string, string>) || {},
+      responseBody: apiDoc.responseBody as Record<string, any> | undefined,
       statusCode: apiDoc.statusCode || undefined,
     });
     

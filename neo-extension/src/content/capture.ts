@@ -47,7 +47,8 @@ function addToQueue(data: ApiCaptureData): void {
  * 上报数据到后端
  */
 async function reportToBackend(data: ApiCaptureData[]): Promise<void> {
-  const backendUrl = 'http://localhost:3000'; // 默认后端地址
+  const { getBackendUrl } = await import('../utils/config');
+  const backendUrl = await getBackendUrl();
   
   try {
     const response = await fetch(`${backendUrl}/api/capture`, {
