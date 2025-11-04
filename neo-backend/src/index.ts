@@ -12,8 +12,45 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// CORS 配置
+const isDevelopment = process.env.NODE_ENV !== 'production';
+const corsOrigins = process.env.CORS_ORIGIN 
+  ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
+  : [];
+
+// 配置 CORS
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    // 开发环境：允许所有来源
+    if (isDevelopment) {
+      callback(null, true);
+      return;
+    }
+    
+    // 生产环境：使用白名单
+    if (corsOrigins.length === 0) {
+      // 如果没有配置，默认允许所有（但不推荐）
+      console.warn('[Neo] Warning: CORS_ORIGIN not configured, allowing all origins');
+      callback(null, true);
+      return;
+    }
+    
+    // 检查是否在白名单中
+    if (!origin || corsOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`Origin ${origin} is not allowed by CORS`));
+    }
+  },
+  credentials: true, // 允许携带凭证（cookie、authorization header 等）
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  exposedHeaders: ['Content-Length', 'X-Request-Id'],
+  maxAge: 86400, // 24小时预检请求缓存
+};
+
 // 中间件
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // 健康检查
