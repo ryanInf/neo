@@ -3,6 +3,7 @@ import { prisma } from '../utils/prisma';
 import { generateRequestHash } from '../utils/hash';
 import { ValidationError, DatabaseError } from '../utils/errors';
 import { validateArray, validateRequired, validateUrl, validateHttpMethod } from '../utils/validation';
+import { apiAnalysisQueue } from '../queues';
 import type { ApiCaptureRequest } from '../models/types';
 
 /**
@@ -56,6 +57,21 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
               updatedAt: new Date(),
             },
           });
+          
+          // 如果还没有文档，自动触发文档生成
+          if (!existing.docMarkdown) {
+            console.log(`[Capture] Queueing analysis job for existing API doc without docMarkdown: ${existing.id}`);
+            apiAnalysisQueue.add('analyze-single', { apiDocId: existing.id })
+              .then(job => {
+                console.log(`[Capture] Analysis job queued successfully: ${job.id} for doc ${existing.id}`);
+              })
+              .catch(error => {
+                console.error(`[Capture] Failed to queue analysis job for doc ${existing.id}:`, error);
+              });
+          } else {
+            console.log(`[Capture] API doc ${existing.id} already has docMarkdown, skipping`);
+          }
+          
           results.push({ id: existing.id, action: 'updated' });
         } else {
           // 创建新记录
@@ -72,6 +88,17 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
               requestHash,
             },
           });
+          
+          // 自动触发文档生成
+          console.log(`[Capture] Queueing analysis job for new API doc: ${apiDoc.id}`);
+          apiAnalysisQueue.add('analyze-single', { apiDocId: apiDoc.id })
+            .then(job => {
+              console.log(`[Capture] Analysis job queued successfully: ${job.id} for doc ${apiDoc.id}`);
+            })
+            .catch(error => {
+              console.error(`[Capture] Failed to queue analysis job for doc ${apiDoc.id}:`, error);
+            });
+          
           results.push({ id: apiDoc.id, action: 'created' });
         }
       } catch (error) {

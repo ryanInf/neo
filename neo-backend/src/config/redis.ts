@@ -9,7 +9,7 @@ dotenv.config();
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
 /**
- * 创建 Redis 连接实例
+ * 创建 Redis 连接实例（通用）
  */
 export function createRedisConnection(): Redis {
   const redis = new Redis(redisUrl, {
@@ -37,6 +37,45 @@ export function createRedisConnection(): Redis {
 
   redis.on('close', () => {
     console.log('[Redis] Redis connection closed');
+  });
+
+  return redis;
+}
+
+/**
+ * 为 Bull 队列创建 Redis 连接
+ * Bull 对 Redis 连接有特殊要求，不能使用 maxRetriesPerRequest 等选项
+ */
+export function createBullRedisConnection(type: 'client' | 'subscriber' | 'bclient'): Redis {
+  // Bull 需要的配置：移除 maxRetriesPerRequest 和 enableReadyCheck
+  const config: any = {
+    retryStrategy: (times: number) => {
+      const delay = Math.min(times * 50, 2000);
+      return delay;
+    },
+    reconnectOnError: (err: Error) => {
+      const targetError = 'READONLY';
+      if (err.message.includes(targetError)) {
+        return true;
+      }
+      return false;
+    },
+  };
+
+  // 对于 subscriber 和 bclient，必须禁用这些选项
+  if (type === 'subscriber' || type === 'bclient') {
+    config.maxRetriesPerRequest = null;
+    config.enableReadyCheck = false;
+  }
+
+  const redis = new Redis(redisUrl, config);
+
+  redis.on('connect', () => {
+    console.log(`[Redis] Bull ${type} connected`);
+  });
+
+  redis.on('error', (err) => {
+    console.error(`[Redis] Bull ${type} connection error:`, err);
   });
 
   return redis;

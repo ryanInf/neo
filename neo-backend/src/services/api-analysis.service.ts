@@ -1,5 +1,5 @@
 import { prisma } from '../utils/prisma';
-import { generateApiDocWithRetry } from '../ai/openai-client';
+import { generateDocMarkdownFromSchema } from './schema-generator';
 import { NotFoundError, DatabaseError } from '../utils/errors';
 
 /**
@@ -21,8 +21,10 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
   }
   
   try {
-    // 生成文档
-    const docMarkdown = await generateApiDocWithRetry({
+    console.log(`[Analysis] Starting doc generation for API: ${apiDoc.url} (${apiDoc.method})`);
+    
+    // 从 Schema 生成文档（不使用 AI）
+    const docMarkdown = generateDocMarkdownFromSchema({
       url: apiDoc.url,
       method: apiDoc.method,
       requestHeaders: (apiDoc.requestHeaders as Record<string, string>) || {},
@@ -31,6 +33,8 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
       responseBody: apiDoc.responseBody as Record<string, any> | undefined,
       statusCode: apiDoc.statusCode || undefined,
     });
+    
+    console.log(`[Analysis] Doc generated, length: ${docMarkdown.length} characters`);
     
     // 更新数据库
     await prisma.apiDoc.update({
@@ -41,9 +45,15 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
       },
     });
     
-    console.log(`Successfully generated doc for API: ${apiDoc.url}`);
+    console.log(`[Analysis] Successfully saved doc for API: ${apiDoc.url}`);
   } catch (error) {
-    console.error(`Error analyzing API doc ${apiDocId}:`, error);
+    console.error(`[Analysis] Error analyzing API doc ${apiDocId}:`, error);
+    if (error instanceof Error) {
+      console.error(`[Analysis] Error details:`, {
+        message: error.message,
+        stack: error.stack,
+      });
+    }
     throw error;
   }
 }

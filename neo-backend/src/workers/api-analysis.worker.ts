@@ -10,13 +10,20 @@ export function startApiAnalysisWorker(): void {
   // 处理单个 API 文档分析任务
   apiAnalysisQueue.process('analyze-single', async (job) => {
     const { apiDocId } = job.data;
-    console.log(`[Worker] Processing API analysis job for doc: ${apiDocId}`);
+    console.log(`[Worker] Processing API analysis job ${job.id} for doc: ${apiDocId}`);
     
     try {
       await analyzeApiDoc(apiDocId);
+      console.log(`[Worker] Successfully completed API analysis job ${job.id} for doc: ${apiDocId}`);
       return { success: true, apiDocId };
     } catch (error) {
-      console.error(`[Worker] Error processing API analysis job ${job.id}:`, error);
+      console.error(`[Worker] Error processing API analysis job ${job.id} for doc ${apiDocId}:`, error);
+      if (error instanceof Error) {
+        console.error(`[Worker] Error details:`, {
+          message: error.message,
+          stack: error.stack,
+        });
+      }
       throw error;
     }
   });

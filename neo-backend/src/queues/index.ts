@@ -1,14 +1,14 @@
 import Queue from 'bull';
-import { createRedisConnection } from '../config/redis';
+import { createBullRedisConnection } from '../config/redis';
 
 /**
  * 队列配置选项
  */
 const queueOptions = {
-  createClient: (type: string) => {
-    // 为每个队列创建独立的 Redis 连接
-    const redis = createRedisConnection();
-    return redis;
+  createClient: (type: 'client' | 'subscriber' | 'bclient') => {
+    // 为 Bull 队列创建专门的 Redis 连接
+    // Bull 对不同类型的连接有特殊要求
+    return createBullRedisConnection(type);
   },
   defaultJobOptions: {
     attempts: 3,
@@ -49,10 +49,21 @@ export function initializeQueueEvents(): void {
 
   apiAnalysisQueue.on('failed', (job, err) => {
     console.error(`[Queue] API analysis job ${job?.id} failed:`, err);
+    if (job?.data) {
+      console.error(`[Queue] Failed job data:`, job.data);
+    }
   });
 
   apiAnalysisQueue.on('error', (error) => {
     console.error('[Queue] API analysis queue error:', error);
+  });
+
+  apiAnalysisQueue.on('active', (job) => {
+    console.log(`[Queue] API analysis job ${job.id} started processing`);
+  });
+
+  apiAnalysisQueue.on('stalled', (job) => {
+    console.warn(`[Queue] API analysis job ${job.id} stalled`);
   });
 
   // 技能优化队列事件

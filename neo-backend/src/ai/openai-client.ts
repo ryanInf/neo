@@ -93,8 +93,10 @@ export async function generateApiDoc(apiData: {
   statusCode?: number;
 }): Promise<string> {
   try {
+    console.log(`[OpenAI] Generating doc for API: ${apiData.url} (${apiData.method})`);
     const prompt = generateApiDocPrompt(apiData);
     
+    console.log(`[OpenAI] Calling SiliconFlow API...`);
     const completion = await openai.chat.completions.create({
       model: 'deepseek-ai/DeepSeek-V3.2-Exp',
       messages: [
@@ -111,18 +113,29 @@ export async function generateApiDoc(apiData: {
       max_tokens: 2000,
     });
     
+    console.log(`[OpenAI] API response received, choices count: ${completion.choices.length}`);
+    
     const docMarkdown = completion.choices[0]?.message?.content || '';
     
     if (!docMarkdown) {
+      console.error(`[OpenAI] Empty response from API. Response:`, JSON.stringify(completion, null, 2));
       throw new ExternalApiError('Empty response from OpenAI');
     }
     
+    console.log(`[OpenAI] Doc generated successfully, length: ${docMarkdown.length} characters`);
     return docMarkdown;
   } catch (error) {
     if (error instanceof ExternalApiError) {
       throw error;
     }
-    console.error('Error generating API doc:', error);
+    console.error('[OpenAI] Error generating API doc:', error);
+    if (error instanceof Error) {
+      console.error('[OpenAI] Error details:', {
+        message: error.message,
+        stack: error.stack,
+        name: error.name,
+      });
+    }
     throw new ExternalApiError('Failed to generate API doc', { originalError: error });
   }
 }

@@ -7,9 +7,17 @@ import { getApiDocs, getApiDocById, analyzeApiDocById, analyzePendingDocs } from
 import { createSkill, getSkills, getSkillById, downloadSkill } from './api/skills';
 import { receiveLogs } from './api/logs';
 import { optimizeSkillById, optimizeAllSkills } from './api/skill-optimize';
+import { initializeQueueEvents } from './queues';
+import { startAllWorkers } from './workers';
 
 // 验证配置
 validateConfig();
+
+// 初始化队列系统
+initializeQueueEvents();
+
+// 启动队列处理器
+startAllWorkers();
 
 const app = express();
 
