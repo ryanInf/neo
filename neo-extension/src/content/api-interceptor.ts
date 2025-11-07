@@ -1,217 +1,89 @@
+/**
+ * API 拦截器 - Content Script 版本
+ * 注入脚本到页面上下文，并监听来自注入脚本的消息
+ */
 import { captureApiCall } from './capture';
 
-/**
- * 拦截 fetch API
- */
-const originalFetch = window.fetch;
+console.log('[Neo] ========================================');
+console.log('[Neo] Content Script: API Interceptor Loading...');
+console.log('[Neo] ========================================');
+console.log('[Neo] window.location:', window.location.href);
 
-window.fetch = async function (
-  input: RequestInfo | URL,
-  init?: RequestInit
-): Promise<Response> {
-  const startTime = Date.now();
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-  const method = init?.method || 'GET';
-  
-  // 捕获请求信息
-  const requestHeaders: Record<string, string> = {};
-  if (init?.headers) {
-    if (init.headers instanceof Headers) {
-      init.headers.forEach((value, key) => {
-        requestHeaders[key] = value;
-      });
-    } else if (Array.isArray(init.headers)) {
-      init.headers.forEach(([key, value]) => {
-        requestHeaders[key] = value;
-      });
-    } else {
-      Object.assign(requestHeaders, init.headers);
-    }
+/**
+ * 注入拦截脚本到页面上下文
+ */
+function injectInterceptorScript() {
+  // 检查是否已经注入
+  if (document.getElementById('__neo_api_interceptor_script')) {
+    console.log('[Neo] Script already injected, skipping');
+    return;
   }
-  
-  let requestBody: any = undefined;
-  if (init?.body) {
-    if (typeof init.body === 'string') {
-      try {
-        requestBody = JSON.parse(init.body);
-      } catch {
-        requestBody = init.body;
-      }
-    } else {
-      requestBody = init.body;
-    }
-  }
-  
+
   try {
-    // 执行原始 fetch
-    const response = await originalFetch(input, init);
+    const script = document.createElement('script');
+    script.id = '__neo_api_interceptor_script';
+    script.src = chrome.runtime.getURL('src/inject/api-interceptor-injected.js');
+    script.onload = function() {
+      console.log('[Neo] ✅ API interceptor script injected successfully');
+    };
+    script.onerror = function(error) {
+      console.error('[Neo] ❌ Failed to inject API interceptor script:', error);
+      console.error('[Neo] Script URL:', chrome.runtime.getURL('src/inject/api-interceptor-injected.js'));
+    };
     
-    const duration = Date.now() - startTime;
-    
-    // 克隆响应以便读取 body
-    const clonedResponse = response.clone();
-    
-    // 异步读取响应体
-    clonedResponse.json().then((responseBody) => {
-      const responseHeaders: Record<string, string> = {};
-      response.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
-      
-      captureApiCall({
-        url,
-        method,
-        requestHeaders,
-        requestBody,
-        responseHeaders,
-        responseBody,
-        statusCode: response.status,
-        duration,
-      });
-    }).catch(() => {
-      // 如果响应不是 JSON，尝试读取文本
-      clonedResponse.text().then((responseText) => {
-        const responseHeaders: Record<string, string> = {};
-        response.headers.forEach((value, key) => {
-          responseHeaders[key] = value;
-        });
-        
-        captureApiCall({
-          url,
-          method,
-          requestHeaders,
-          requestBody,
-          responseHeaders,
-          responseBody: responseText,
-          statusCode: response.status,
-          duration,
-        });
-      }).catch(() => {
-        // 无法读取响应体，只记录基本信息
-        const responseHeaders: Record<string, string> = {};
-        response.headers.forEach((value, key) => {
-          responseHeaders[key] = value;
-        });
-        
-        captureApiCall({
-          url,
-          method,
-          requestHeaders,
-          requestBody,
-          responseHeaders,
-          statusCode: response.status,
-          duration,
-        });
-      });
-    });
-    
-    return response;
+    // 在 document_start 时，document.head 可能还不存在，使用 document.documentElement
+    (document.head || document.documentElement).appendChild(script);
+    console.log('[Neo] 📤 Injecting script into page context...');
   } catch (error) {
-    const duration = Date.now() - startTime;
-    
-    // 记录错误
-    captureApiCall({
-      url,
-      method,
-      requestHeaders,
-      requestBody,
-      statusCode: 0,
-      duration,
+    console.error('[Neo] ❌ Error injecting script:', error);
+    console.error('[Neo] Error details:', {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
     });
-    
-    throw error;
   }
-};
+}
+
+// 立即注入（在 document_start 时执行）
+injectInterceptorScript();
+
+// 如果 DOM 还没准备好，也监听 DOMContentLoaded
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', injectInterceptorScript);
+}
 
 /**
- * 拦截 XMLHttpRequest
+ * 监听来自注入脚本的 API 调用消息
  */
-const originalXHROpen = XMLHttpRequest.prototype.open;
-const originalXHRSend = XMLHttpRequest.prototype.send;
-
-XMLHttpRequest.prototype.open = function (
-  method: string,
-  url: string | URL,
-  async?: boolean,
-  username?: string | null,
-  password?: string | null
-): void {
-  (this as any)._neoMethod = method;
-  (this as any)._neoUrl = typeof url === 'string' ? url : url.toString();
-  (this as any)._neoStartTime = Date.now();
-  
-  return originalXHROpen.call(this, method, url, async, username, password);
-};
-
-XMLHttpRequest.prototype.send = function (body?: Document | XMLHttpRequestBodyInit | null): void {
-  const xhr = this as any;
-  const method = xhr._neoMethod || 'GET';
-  const url = xhr._neoUrl || '';
-  const startTime = xhr._neoStartTime || Date.now();
-  
-  // 捕获请求头
-  const requestHeaders: Record<string, string> = {};
-  // 注意：XHR 的请求头在 send 之前设置，我们需要在设置时捕获
-  // 这里我们只记录响应头，请求头在监听中无法完全获取
-  
-  let requestBody: any = undefined;
-  if (body) {
-    if (typeof body === 'string') {
-      try {
-        requestBody = JSON.parse(body);
-      } catch {
-        requestBody = body;
-      }
-    } else {
-      requestBody = body;
-    }
+window.addEventListener('message', (event) => {
+  // 只处理来自当前窗口的消息
+  if (event.source !== window) {
+    return;
   }
-  
-  // 监听 readyState 变化
-  xhr.addEventListener('readystatechange', function () {
-    if (xhr.readyState === 4) {
-      const duration = Date.now() - startTime;
-      
-      const responseHeaders: Record<string, string> = {};
-      const headers = xhr.getAllResponseHeaders();
-      if (headers) {
-        headers.split('\r\n').forEach((line: string) => {
-          const [key, ...valueParts] = line.split(': ');
-          if (key && valueParts.length > 0) {
-            responseHeaders[key] = valueParts.join(': ');
-          }
-        });
-      }
-      
-      let responseBody: any = undefined;
-      try {
-        responseBody = JSON.parse(xhr.responseText);
-      } catch {
-        responseBody = xhr.responseText;
-      }
-      
-      captureApiCall({
-        url,
-        method,
-        requestHeaders,
-        requestBody,
-        responseHeaders,
-        responseBody,
-        statusCode: xhr.status,
-        duration,
-      });
-    }
-  });
-  
-  return originalXHRSend.call(this, body);
-};
 
-// 页面卸载时立即上报
-window.addEventListener('beforeunload', () => {
-  import('./capture').then(({ flushQueue }) => {
-    flushQueue();
-  });
+  // 处理 API 调用消息
+  if (event.data.type === '__neo.api_call') {
+    const data = event.data.payload;
+    
+    console.log('[Neo] 📨 Received API call from injected script:', {
+      url: data.url,
+      method: data.method,
+    });
+    
+    // 调用 captureApiCall 上报数据
+    captureApiCall({
+      url: data.url,
+      method: data.method,
+      requestHeaders: data.requestHeaders || {},
+      requestBody: data.requestBody,
+      responseHeaders: data.responseHeaders || {},
+      responseBody: data.responseBody,
+      statusCode: data.statusCode,
+      duration: data.duration,
+      timestamp: data.timestamp || Date.now(),
+    });
+  }
 });
 
-console.log('[Neo] Content script loaded, API interception enabled');
+console.log('[Neo] ✅ Content script loaded, listening for API calls');
+console.log('[Neo] ========================================');
 
