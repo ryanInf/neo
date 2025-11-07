@@ -17,25 +17,25 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content/index.js"],
+      "js": ["src/content/index.ts"],
       "run_at": "document_start"
     }
   ],
   "background": {
-    "service_worker": "background/index.js"
+    "service_worker": "src/background/index.ts"
   },
   "action": {
-    "default_popup": "popup/index.html",
+    "default_popup": "src/popup/index.html",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "src/icons/icon16.png",
+      "48": "src/icons/icon48.png",
+      "128": "src/icons/icon128.png"
     }
   },
   "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "src/icons/icon16.png",
+    "48": "src/icons/icon48.png",
+    "128": "src/icons/icon128.png"
   }
 }
 
