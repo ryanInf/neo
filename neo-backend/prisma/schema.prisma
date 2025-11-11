@@ -15,7 +15,6 @@ model ApiDoc {
   domain          String
   requestHeaders  Json
   requestBody     Json?
-  responseHeaders Json
   responseBody    Json?
   statusCode      Int?
   docMarkdown     String?  // AI 生成的文档

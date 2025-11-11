@@ -9,11 +9,11 @@ export interface ApiCaptureData {
   domain: string;
   requestHeaders: Record<string, string>;
   requestBody?: any;
-  responseHeaders: Record<string, string>;
   responseBody?: any;
   statusCode?: number;
   timestamp: number;
   duration?: number;
+  source?: string;
 }
 
 /**
@@ -102,6 +102,13 @@ async function reportToBackend(data: ApiCaptureData[]): Promise<void> {
       stack: error instanceof Error ? error.stack : undefined,
       captureCount: data.length,
     });
+    
+    // 检查是否是扩展上下文失效错误
+    if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+      console.warn('[Neo] ⚠️  Extension context invalidated, skipping retry');
+      return;
+    }
+    
     // 重新加入队列，稍后重试
     data.forEach(item => addToQueue(item));
   }
@@ -139,44 +146,78 @@ export function captureApiCall(data: Partial<ApiCaptureData>): void {
       return;
     }
 
+    const resolvedUrl = resolveCaptureUrl(data.url);
+    if (!resolvedUrl) {
+      console.warn('[Neo] ⚠️  captureApiCall received unresolved URL, skipping:', {
+        url: data.url,
+        context: window.location.href,
+      });
+      return;
+    }
+
     console.log('[Neo] 📝 captureApiCall called:', {
-      url: data.url,
+      rawUrl: data.url,
+      resolvedUrl,
       method: data.method || 'GET',
     });
     
-    const domain = new URL(data.url).hostname;
+    const domain = new URL(resolvedUrl).hostname;
     
+    const captureTimestamp = typeof data.timestamp === 'number' ? data.timestamp : Date.now();
+
     const captureData: ApiCaptureData = {
-      url: sanitizeUrl(data.url),
+      url: sanitizeUrl(resolvedUrl),
       method: data.method || 'GET',
       domain,
       requestHeaders: sanitizeHeaders(data.requestHeaders || {}),
       requestBody: data.requestBody ? sanitizeBody(data.requestBody) : undefined,
-      responseHeaders: sanitizeHeaders(data.responseHeaders || {}),
       responseBody: data.responseBody ? sanitizeBody(data.responseBody) : undefined,
       statusCode: data.statusCode,
-      timestamp: Date.now(),
+      timestamp: captureTimestamp,
       duration: data.duration,
+      source: data.source,
     };
-    
+
     console.log('[Neo] ➕ Adding to queue:', {
       url: captureData.url,
       method: captureData.method,
       statusCode: captureData.statusCode,
+      source: captureData.source,
       queueLength: captureQueue.length,
     });
-    
     addToQueue(captureData);
     
     // 启动定时器（如果还没启动）
     startBatchTimer();
   } catch (error) {
     console.error('[Neo] ❌ Error in captureApiCall:', error);
-    console.error('[Neo] Error details:', {
-      message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-      data: data,
-    });
+    try {
+      console.error('[Neo] Error details:', JSON.stringify({
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        data,
+        location: window.location.href,
+      }, null, 2));
+    } catch {
+      console.error('[Neo] Error details: [unserializable data]', data);
+    }
+  }
+}
+
+function resolveCaptureUrl(url: string): string {
+  if (!url) {
+    return '';
+  }
+
+  try {
+    return new URL(url).toString();
+  } catch {
+    try {
+      return new URL(url, window.location.href).toString();
+    } catch (error) {
+      console.warn('[Neo] ⚠️  Failed to resolve capture URL:', url, error);
+      return '';
+    }
   }
 }
 

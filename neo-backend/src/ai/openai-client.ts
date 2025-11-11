@@ -16,7 +16,6 @@ function generateApiDocPrompt(apiData: {
   method: string;
   requestHeaders: Record<string, string>;
   requestBody?: any;
-  responseHeaders: Record<string, string>;
   responseBody?: any;
   statusCode?: number;
 }): string {
@@ -35,11 +34,6 @@ ${JSON.stringify(apiData.requestHeaders, null, 2)}
 请求体：
 \`\`\`json
 ${apiData.requestBody ? JSON.stringify(apiData.requestBody, null, 2) : '无'}
-\`\`\`
-
-响应头：
-\`\`\`json
-${JSON.stringify(apiData.responseHeaders, null, 2)}
 \`\`\`
 
 响应体：
@@ -88,7 +82,6 @@ export async function generateApiDoc(apiData: {
   method: string;
   requestHeaders: Record<string, string>;
   requestBody?: any;
-  responseHeaders: Record<string, string>;
   responseBody?: any;
   statusCode?: number;
 }): Promise<string> {
@@ -149,7 +142,6 @@ export async function generateApiDocWithRetry(
     method: string;
     requestHeaders: Record<string, string>;
     requestBody?: any;
-    responseHeaders: Record<string, string>;
     responseBody?: any;
     statusCode?: number;
   },

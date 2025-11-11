@@ -315,11 +315,10 @@ export function generateDocMarkdownFromSchema(data: {
   method: string;
   requestHeaders: Record<string, string>;
   requestBody?: any;
-  responseHeaders: Record<string, string>;
   responseBody?: any;
   statusCode?: number;
 }): string {
-  const { url, method, requestHeaders, requestBody, responseHeaders, responseBody, statusCode } = data;
+  const { url, method, requestHeaders, requestBody, responseBody, statusCode } = data;
   
   // 解析 URL
   const urlInfo = parseUrl(url);
@@ -398,19 +397,6 @@ export function generateDocMarkdownFromSchema(data: {
       markdown += `${JSON.stringify(requestBody, null, 2)}\n`;
       markdown += `\`\`\`\n\n`;
     }
-  }
-  
-  // 响应头
-  markdown += `## 响应头 (Response Headers)\n\n`;
-  if (Object.keys(responseHeaders).length === 0) {
-    markdown += `无响应头\n\n`;
-  } else {
-    markdown += `| 字段 | 值 |\n`;
-    markdown += `|------|------|\n`;
-    for (const [key, value] of Object.entries(responseHeaders)) {
-      markdown += `| \`${key}\` | \`${value}\` |\n`;
-    }
-    markdown += `\n`;
   }
   
   // 响应体 Schema

@@ -39,12 +39,266 @@
   }
 
   /**
+   * 检查是否应该跳过此请求（扩展内部请求等）
+   */
+  function shouldSkipRequest(url) {
+    if (!url) {
+      return true;
+    }
+    // 跳过扩展内部请求
+    if (url.startsWith('chrome-extension://') || url.startsWith('chrome://')) {
+      return true;
+    }
+    // 跳过后端 API 请求
+    if (isBackendApi(url)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 解析 URL，如果是相对路径则转为绝对路径
+   */
+  function resolveUrl(url) {
+    if (!url) {
+      return '';
+    }
+    try {
+      const resolved = new URL(url, window.location.href).toString();
+      return resolved;
+    } catch (error) {
+      console.warn('[Neo] ⚠️  Failed to resolve URL:', url, error);
+      return '';
+    }
+  }
+
+  /**
+   * 将各种 headers 表示方式转换为普通对象
+   */
+  function headersToObject(headers) {
+    const result = {};
+    if (!headers) {
+      return result;
+    }
+
+    try {
+      if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+        headers.forEach((value, key) => {
+          result[key] = value;
+        });
+        return result;
+      }
+
+      if (Array.isArray(headers)) {
+        headers.forEach((entry) => {
+          if (!entry) {
+            return;
+          }
+          const [key, value] = entry;
+          if (key) {
+            result[key] = value;
+          }
+        });
+        return result;
+      }
+
+      if (typeof headers === 'object') {
+        Object.keys(headers).forEach((key) => {
+          result[key] = headers[key];
+        });
+      }
+    } catch (error) {
+      console.warn('[Neo] ⚠️  Failed to normalize headers:', error);
+    }
+
+    return result;
+  }
+
+  function mergeHeaders(target, source) {
+    if (!source) {
+      return;
+    }
+    const normalized = headersToObject(source);
+    Object.keys(normalized).forEach((key) => {
+      target[key] = normalized[key];
+    });
+  }
+
+  function tryParseJsonString(text) {
+    if (typeof text !== 'string') {
+      return text;
+    }
+    if (!text.length) {
+      return '';
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
+  function serializeBody(body) {
+    if (body === undefined || body === null) {
+      return body;
+    }
+
+    if (typeof body === 'string') {
+      return tryParseJsonString(body);
+    }
+
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+      return body.toString();
+    }
+
+    if (typeof FormData !== 'undefined' && body instanceof FormData) {
+      const formDataObj = {};
+      try {
+        body.forEach((value, key) => {
+          let serializedValue;
+          if (typeof File !== 'undefined' && value instanceof File) {
+            serializedValue = `[File:${value.name ?? 'unknown'}]`;
+          } else if (typeof Blob !== 'undefined' && value instanceof Blob) {
+            serializedValue = `[Blob:${value.size ?? 'unknown'}]`;
+          } else {
+            serializedValue = value;
+          }
+
+          if (Object.prototype.hasOwnProperty.call(formDataObj, key)) {
+            const existing = formDataObj[key];
+            if (Array.isArray(existing)) {
+              existing.push(serializedValue);
+            } else {
+              formDataObj[key] = [existing, serializedValue];
+            }
+          } else {
+            formDataObj[key] = serializedValue;
+          }
+        });
+      } catch (error) {
+        console.warn('[Neo] ⚠️  Failed to iterate FormData:', error);
+        return '[无法解析 FormData]';
+      }
+      return { __type: 'FormData', fields: formDataObj };
+    }
+
+    if (typeof Blob !== 'undefined' && body instanceof Blob) {
+      return `[Blob:${body.size ?? 'unknown'}]`;
+    }
+
+    if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+      return `[ArrayBuffer:${body.byteLength}]`;
+    }
+
+    if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView && ArrayBuffer.isView(body)) {
+      return `[TypedArray:${body.byteLength}]`;
+    }
+
+    return body;
+  }
+
+  async function extractRequestBody(input, init) {
+    if (init?.body !== undefined) {
+      return serializeBody(init.body);
+    }
+
+    if (typeof Request === 'undefined' || !(input instanceof Request)) {
+      return undefined;
+    }
+
+    if (input.bodyUsed) {
+      return '[请求体已被读取]';
+    }
+
+    try {
+      const clonedRequest = input.clone();
+      const text = await clonedRequest.text();
+      if (text === '') {
+        return undefined;
+      }
+      const headers = typeof input.headers?.get === 'function' ? input.headers : undefined;
+      const contentType = headers ? (headers.get('content-type') || '').toLowerCase() : '';
+
+      if (contentType.includes('multipart/form-data')) {
+        return '[FormData]';
+      }
+
+      if (contentType.includes('application/x-www-form-urlencoded')) {
+        try {
+          const params = new URLSearchParams(text);
+          const result = {};
+          params.forEach((value, key) => {
+            if (Object.prototype.hasOwnProperty.call(result, key)) {
+              const existing = result[key];
+              if (Array.isArray(existing)) {
+                existing.push(value);
+              } else {
+                result[key] = [existing, value];
+              }
+            } else {
+              result[key] = value;
+            }
+          });
+          return result;
+        } catch (error) {
+          console.warn('[Neo] ⚠️  Failed to parse urlencoded request body:', error);
+        }
+      }
+
+      if (contentType.includes('application/json') || contentType.includes('+json')) {
+        return tryParseJsonString(text);
+      }
+
+      const trimmed = text.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        return tryParseJsonString(text);
+      }
+
+      return text;
+    } catch (error) {
+      console.warn('[Neo] ⚠️  Failed to read request body from Request:', error);
+      return '[无法读取请求体]';
+    }
+  }
+
+  async function readResponseBody(response) {
+    try {
+      const clonedResponse = response.clone();
+      const contentType = (response.headers?.get?.('content-type') || '').toLowerCase();
+      const text = await clonedResponse.text();
+
+      if (text === '') {
+        return '';
+      }
+
+      if (contentType.includes('application/json') || contentType.includes('+json')) {
+        return tryParseJsonString(text);
+      }
+
+      const trimmed = text.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        const parsed = tryParseJsonString(text);
+        if (parsed !== text) {
+          return parsed;
+        }
+      }
+
+      return text;
+    } catch (error) {
+      console.warn('[Neo] ⚠️  Failed to read response body:', error);
+      return '[无法读取响应体]';
+    }
+  }
+
+
+  /**
    * 发送 API 调用数据到 content script
    */
-  function sendApiCall(data) {
+  function sendApiCall(data, source) {
+    const payload = source ? { ...data, source } : data;
     window.postMessage({
       type: '__neo.api_call',
-      payload: data
+      payload
     }, '*');
   }
 
@@ -64,137 +318,127 @@
 
     window.fetch = async function (input, init) {
       const startTime = Date.now();
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-      const method = init?.method || 'GET';
-      
+      const rawUrl = typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (typeof Request !== 'undefined' && input instanceof Request ? input.url : input?.url ?? '');
+      const resolvedUrl = resolveUrl(rawUrl);
+      const captureUrl = resolvedUrl || '';
+      const rawMethod = init?.method || (typeof Request !== 'undefined' && input instanceof Request ? input.method : undefined) || 'GET';
+      const method = typeof rawMethod === 'string' ? rawMethod : String(rawMethod);
+
       // 立即打印检查到的 API
       console.log('[Neo] 🔍 API detected (fetch):', {
-        url,
+        rawUrl,
+        resolvedUrl,
         method,
         timestamp: new Date().toISOString(),
       });
-      
-      // 跳过后端 API 请求（避免循环上报）
-      if (isBackendApi(url)) {
-        console.log('[Neo] ⏭️  Skipping backend API:', url);
+
+      // 跳过后端 API 请求和扩展内部请求（避免循环上报）
+      if (shouldSkipRequest(resolvedUrl || rawUrl || '')) {
+        console.log('[Neo] ⏭️  Skipping request:', resolvedUrl || rawUrl);
         return originalFetch(input, init);
       }
-      
+
       // 捕获请求信息
       const requestHeaders = {};
+      if (typeof Request !== 'undefined' && input instanceof Request) {
+        mergeHeaders(requestHeaders, input.headers);
+      }
       if (init?.headers) {
-        if (init.headers instanceof Headers) {
-          init.headers.forEach((value, key) => {
-            requestHeaders[key] = value;
-          });
-        } else if (Array.isArray(init.headers)) {
-          init.headers.forEach(([key, value]) => {
-            requestHeaders[key] = value;
-          });
-        } else {
-          Object.assign(requestHeaders, init.headers);
-        }
+        mergeHeaders(requestHeaders, init.headers);
       }
-      
-      let requestBody = undefined;
-      if (init?.body) {
-        if (typeof init.body === 'string') {
-          try {
-            requestBody = JSON.parse(init.body);
-          } catch {
-            requestBody = init.body;
-          }
-        } else {
-          requestBody = init.body;
-        }
+
+      let requestBody = await extractRequestBody(input, init);
+      if (requestBody === '') {
+        requestBody = undefined;
       }
-      
+
       try {
         // 执行原始 fetch
         const response = await originalFetch(input, init);
-        
+
         const duration = Date.now() - startTime;
-        console.log('[Neo] 📥 Fetch response:', url, response.status, duration + 'ms');
-        
-        // 克隆响应以便读取 body
-        const clonedResponse = response.clone();
-        
-        // 异步读取响应体
-        clonedResponse.json().then((responseBody) => {
-          const responseHeaders = {};
-          response.headers.forEach((value, key) => {
-            responseHeaders[key] = value;
+        console.log('[Neo] 📥 Fetch response:', resolvedUrl || rawUrl, response.status, duration + 'ms');
+
+        if (!captureUrl) {
+          console.warn('[Neo] ⚠️  Skipping capture due to unresolved URL:', {
+            rawUrl,
+            resolvedUrl,
           });
-          
-          console.log('[Neo] 💾 Capturing API call (JSON):', url);
+          return response;
+        }
+
+        readResponseBody(response).then((responseBody) => {
+          const hasBody = responseBody !== undefined
+            && responseBody !== null
+            && responseBody !== '[无法读取响应体]'
+            && !(typeof responseBody === 'string' && responseBody.length === 0);
+          console.log('[Neo] 💾 Capturing API call (fetch):', captureUrl, {
+            statusCode: response.status,
+            duration,
+            hasBody,
+            bodyType: typeof responseBody,
+          });
+
           sendApiCall({
-            url,
+            url: captureUrl,
             method,
             requestHeaders,
             requestBody,
-            responseHeaders,
             responseBody,
             statusCode: response.status,
             duration,
             timestamp: Date.now(),
-          });
-        }).catch(() => {
-          // 如果响应不是 JSON，尝试读取文本
-          clonedResponse.text().then((responseText) => {
-            const responseHeaders = {};
-            response.headers.forEach((value, key) => {
-              responseHeaders[key] = value;
-            });
-            
-            console.log('[Neo] 💾 Capturing API call (text):', url);
+          }, 'injected-fetch');
+        }).catch((readError) => {
+          const fallbackUrl = captureUrl || resolvedUrl || rawUrl || '';
+          console.error('[Neo] ❌ Failed to read fetch response body:', fallbackUrl, readError);
+          if (fallbackUrl) {
             sendApiCall({
-              url,
+              url: fallbackUrl,
               method,
               requestHeaders,
               requestBody,
-              responseHeaders,
-              responseBody: responseText,
               statusCode: response.status,
               duration,
               timestamp: Date.now(),
+              error: 'Failed to read response body',
+            }, 'injected-fetch');
+          } else {
+            console.warn('[Neo] ⚠️  Skipped fetch response body error capture due to unresolved URL:', {
+              rawUrl,
+              resolvedUrl,
             });
-          }).catch(() => {
-            // 无法读取响应体，只记录基本信息
-            const responseHeaders = {};
-            response.headers.forEach((value, key) => {
-              responseHeaders[key] = value;
-            });
-            
-            console.log('[Neo] 💾 Capturing API call (no body):', url);
-            sendApiCall({
-              url,
-              method,
-              requestHeaders,
-              requestBody,
-              responseHeaders,
-              statusCode: response.status,
-              duration,
-              timestamp: Date.now(),
-            });
-          });
+          }
         });
-        
+
         return response;
       } catch (error) {
         const duration = Date.now() - startTime;
-        
-        console.error('[Neo] ❌ Fetch error:', url, error);
-        sendApiCall({
-          url,
-          method,
-          requestHeaders,
-          requestBody,
-          statusCode: 0,
-          duration,
-          timestamp: Date.now(),
-          error: error.message,
-        });
-        
+
+        const fallbackUrl = captureUrl || resolvedUrl || rawUrl || '';
+        console.error('[Neo] ❌ Fetch error:', fallbackUrl, error);
+        if (fallbackUrl) {
+          sendApiCall({
+            url: fallbackUrl,
+            method,
+            requestHeaders,
+            requestBody,
+            statusCode: 0,
+            duration,
+            timestamp: Date.now(),
+            error: error.message,
+          }, 'injected-fetch');
+        } else {
+          console.warn('[Neo] ⚠️  Skipped fetch error capture due to unresolved URL:', {
+            rawUrl,
+            resolvedUrl,
+          });
+        }
+
         throw error;
       }
     };
@@ -230,14 +474,19 @@
     }
 
     XMLHttpRequest.prototype.open = function (method, url, async, username, password) {
+      const rawUrl = typeof url === 'string' ? url : url?.toString?.() ?? '';
+      const resolvedUrl = resolveUrl(rawUrl);
+
       this._neoMethod = method;
-      this._neoUrl = typeof url === 'string' ? url : url.toString();
+      this._neoRawUrl = rawUrl;
+      this._neoUrl = resolvedUrl || '';
       this._neoStartTime = Date.now();
       this._neoRequestHeaders = {};
       
       // 立即打印检查到的 API
       console.log('[Neo] 🔍 API detected (XHR):', {
-        url: typeof url === 'string' ? url : url.toString(),
+        rawUrl,
+        resolvedUrl,
         method,
         timestamp: new Date().toISOString(),
       });
@@ -256,13 +505,22 @@
     XMLHttpRequest.prototype.send = function (body) {
       const xhr = this;
       const method = xhr._neoMethod || 'GET';
+      const rawUrl = xhr._neoRawUrl || '';
       const url = xhr._neoUrl || '';
       const startTime = xhr._neoStartTime || Date.now();
       const requestHeaders = xhr._neoRequestHeaders || {};
       
-      // 跳过后端 API 请求（避免循环上报）
-      if (isBackendApi(url)) {
-        console.log('[Neo] ⏭️  Skipping backend API (XHR):', url);
+      console.log('[Neo] 🔍 XHR send called:', {
+        rawUrl,
+        resolvedUrl: url,
+        method,
+        readyState: xhr.readyState,
+        headersCount: Object.keys(requestHeaders).length,
+      });
+      
+      // 跳过后端 API 请求和扩展内部请求（避免循环上报）
+      if (shouldSkipRequest(url || rawUrl)) {
+        console.log('[Neo] ⏭️  Skipping request (XHR):', url || rawUrl);
         return originalXHRSend.call(this, body);
       }
       
@@ -283,84 +541,114 @@
         }
       }
       
-      // 监听 readyState 变化
-      const handleReadyStateChange = function () {
-        if (xhr.readyState === 4) {
-          const duration = Date.now() - startTime;
-          console.log('[Neo] 📥 XHR response:', url, xhr.status, duration + 'ms');
-          
-          const responseHeaders = {};
-          const headers = xhr.getAllResponseHeaders();
-          if (headers) {
-            headers.split('\r\n').forEach((line) => {
-              const [key, ...valueParts] = line.split(': ');
-              if (key && valueParts.length > 0) {
-                responseHeaders[key.trim()] = valueParts.join(': ').trim();
-              }
-            });
-          }
-          
-          let responseBody = undefined;
-          try {
-            if (xhr.responseType === '' || xhr.responseType === 'text') {
-              try {
-                responseBody = JSON.parse(xhr.responseText);
-              } catch {
-                responseBody = xhr.responseText;
-              }
-            } else {
-              responseBody = xhr.response;
+      // 处理响应的函数
+      const handleResponse = function () {
+        const duration = Date.now() - startTime;
+        console.log('[Neo] 📥 XHR response:', url || rawUrl, xhr.status, duration + 'ms', 'readyState:', xhr.readyState);
+
+        if (!url) {
+          console.warn('[Neo] ⚠️  Skipping XHR capture due to unresolved URL:', {
+            rawUrl,
+            resolvedUrl: url,
+          });
+          return;
+        }
+        
+        let responseBody = undefined;
+        try {
+          if (xhr.responseType === '' || xhr.responseType === 'text') {
+            try {
+              responseBody = JSON.parse(xhr.responseText);
+            } catch {
+              responseBody = xhr.responseText;
             }
-          } catch {
-            responseBody = '[无法解析响应]';
+          } else {
+            responseBody = xhr.response;
           }
-          
-          console.log('[Neo] 💾 Capturing XHR API call:', url);
+        } catch (e) {
+          console.warn('[Neo] ⚠️  Failed to parse response body:', e);
+          responseBody = '[无法解析响应]';
+        }
+        
+        console.log('[Neo] 💾 Capturing XHR API call:', url, {
+          statusCode: xhr.status,
+          hasBody: !!responseBody,
+        });
+        
+        try {
           sendApiCall({
             url,
             method,
             requestHeaders,
             requestBody,
-            responseHeaders,
             responseBody,
             statusCode: xhr.status,
             duration,
             timestamp: Date.now(),
-          });
+          }, 'injected-xhr');
+          console.log('[Neo] ✅ XHR API call sent successfully');
+        } catch (e) {
+          console.error('[Neo] ❌ Failed to send XHR API call:', e);
+        }
+      };
+      
+      // 监听 readyState 变化
+      const handleReadyStateChange = function () {
+        console.log('[Neo] 📊 XHR readyState changed:', url, 'readyState:', xhr.readyState);
+        if (xhr.readyState === 4) {
+          handleResponse();
         }
       };
       
       // 使用 {once: true} 确保监听器只触发一次，避免累积
       xhr.addEventListener('readystatechange', handleReadyStateChange, { once: true });
       
+      // 如果请求已经完成（可能在某些情况下发生），立即处理
+      if (xhr.readyState === 4) {
+        console.log('[Neo] ⚠️  XHR already completed, handling immediately');
+        setTimeout(handleResponse, 0);
+      }
+      
       // 监听错误事件 - 使用 {once: true} 避免重复触发
       xhr.addEventListener('error', () => {
-        console.error('[Neo] ❌ XHR error:', url);
-        sendApiCall({
-          url,
-          method,
-          requestHeaders,
-          requestBody,
-          statusCode: 0,
-          duration: Date.now() - startTime,
-          timestamp: Date.now(),
-          error: 'Network error',
-        });
+        console.error('[Neo] ❌ XHR error:', url || rawUrl);
+        if (url) {
+          sendApiCall({
+            url,
+            method,
+            requestHeaders,
+            requestBody,
+            statusCode: 0,
+            duration: Date.now() - startTime,
+            timestamp: Date.now(),
+            error: 'Network error',
+          }, 'injected-xhr');
+        } else {
+          console.warn('[Neo] ⚠️  Skipped XHR error capture due to unresolved URL:', {
+            rawUrl,
+          });
+        }
       }, { once: true });
       
       // 监听超时事件 - 使用 {once: true} 避免重复触发
       xhr.addEventListener('timeout', () => {
-        console.error('[Neo] ⏱️  XHR timeout:', url);
-        sendApiCall({
-          url,
-          method,
-          requestHeaders,
-          requestBody,
-          statusCode: 0,
-          duration: Date.now() - startTime,
-          timestamp: Date.now(),
-          error: 'Timeout',
-        });
+        console.error('[Neo] ⏱️  XHR timeout:', url || rawUrl);
+        if (url) {
+          sendApiCall({
+            url,
+            method,
+            requestHeaders,
+            requestBody,
+            statusCode: 0,
+            duration: Date.now() - startTime,
+            timestamp: Date.now(),
+            error: 'Timeout',
+          }, 'injected-xhr');
+        } else {
+          console.warn('[Neo] ⚠️  Skipped XHR timeout capture due to unresolved URL:', {
+            rawUrl,
+          });
+        }
       }, { once: true });
       
       return originalXHRSend.call(this, body);

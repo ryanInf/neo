@@ -127,15 +127,67 @@ export function generateSkillCode(
             .join('\n')
         : '';
       
+      // 处理循环逻辑
+      let loopWrapper = '';
+      let loopClose = '';
+      
+      if (apiCall.loopType === 'forEach' && apiCall.loopCondition) {
+        // forEach 循环：遍历 state 中的某个数组
+        // loopCondition 应该是数组的路径，例如 items 或 result0.data.items
+        const arrayPath = apiCall.loopCondition.startsWith('$') 
+          ? apiCall.loopCondition.substring(1) 
+          : apiCall.loopCondition;
+        const arrayAccess = arrayPath.split('.').map((part, i) => 
+          i === 0 ? `state.get('${part}')` : `?.${part}`
+        ).join('');
+        const maxIterations = apiCall.maxIterations || 1000;
+        loopWrapper = `
+  // 循环执行步骤 ${apiCall.order}
+  const loopArray${index} = ${arrayAccess} || [];
+  const maxIter${index} = Math.min(loopArray${index}.length, ${maxIterations});
+  for (let i${index} = 0; i${index} < maxIter${index}; i${index}++) {
+    const item${index} = loopArray${index}[i${index}];
+    state.set('_currentItem', item${index});
+    state.set('_currentIndex', i${index});`;
+        loopClose = `  }`;
+      } else if (apiCall.loopType === 'while' && apiCall.loopCondition) {
+        // while 循环
+        const maxIterations = apiCall.maxIterations || 1000;
+        loopWrapper = `
+  // while 循环执行步骤 ${apiCall.order}
+  let loopCount${index} = 0;
+  while (${apiCall.loopCondition} && loopCount${index} < ${maxIterations}) {
+    loopCount${index}++;`;
+        loopClose = `  }`;
+      }
+      
+      const indent = loopWrapper ? '    ' : '  ';
+      const innerIndent = loopWrapper ? '      ' : '    ';
+      
+      // 处理 paramsCode 的缩进
+      let formattedParamsCode = '';
+      if (paramsCode) {
+        const paramLines = paramsCode.split('\n');
+        formattedParamsCode = paramLines.map((line, lineIndex) => {
+          if (lineIndex === 0) {
+            // 第一行是逗号，保持原样
+            return line;
+          }
+          // 其他行需要添加缩进
+          return innerIndent + line.trim();
+        }).join('\n');
+      }
+      
       return `
+${loopWrapper}
   // 步骤 ${apiCall.order}: ${apiCall.apiDocId}
-  ${apiCall.condition ? `if (${apiCall.condition}) {` : ''}
-  const result${index} = await api.call({
-    url: '${url}',
-    method: '${method}'${paramsCode}
-  });
-  ${outputMappingCode ? `\n    ${outputMappingCode}` : ''}
-  ${apiCall.condition ? '  }' : ''}`;
+  ${apiCall.condition ? `${indent}if (${apiCall.condition}) {` : ''}
+${indent}  const result${index} = await api.call({
+${indent}    url: '${url}',
+${indent}    method: '${method}'${formattedParamsCode}
+${indent}  });
+  ${outputMappingCode ? `\n${indent}  ${outputMappingCode.split('\n').map(line => innerIndent + line.trim()).join(`\n${indent}  `)}` : ''}
+  ${apiCall.condition ? `${indent}}` : ''}${loopClose}`;
     })
     .join('');
 

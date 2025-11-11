@@ -8,7 +8,6 @@ export interface ApiDoc {
   domain: string;
   requestHeaders: Record<string, string>;
   requestBody?: any;
-  responseHeaders: Record<string, string>;
   responseBody?: any;
   statusCode?: number;
   docMarkdown?: string;
@@ -23,7 +22,6 @@ export interface ApiCaptureRequest {
     domain: string;
     requestHeaders: Record<string, string>;
     requestBody?: any;
-    responseHeaders: Record<string, string>;
     responseBody?: any;
     statusCode?: number;
     timestamp: number;

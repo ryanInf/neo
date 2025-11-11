@@ -179,7 +179,7 @@ Neo 系统包含四个核心领域：
 **ApiCapture**：
 - 原始信息：originalUrl、method、domain
 - 提取的参数值：pathParams、queryParams（JSON）
-- 请求和响应快照：requestHeaders、requestBody、responseHeaders、responseBody
+- 请求和响应快照：requestHeaders、requestBody、responseBody
 - 调用上下文：pageUrl、userAgent、sessionId、sequenceOrder
 
 **Skill**：

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { prisma } from '../utils/prisma';
+import { Prisma } from '@prisma/client';
 import { generateRequestHash } from '../utils/hash';
 import { ValidationError, DatabaseError } from '../utils/errors';
 import { validateArray, validateRequired, validateUrl, validateHttpMethod } from '../utils/validation';
@@ -46,16 +47,17 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
         
         if (existing) {
           // 更新现有记录
+          const updateData = {
+            requestHeaders: (capture.requestHeaders ?? {}) as Prisma.InputJsonValue,
+            requestBody: (capture.requestBody ?? Prisma.JsonNull) as Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue,
+            responseBody: (capture.responseBody ?? Prisma.JsonNull) as Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue,
+            statusCode: capture.statusCode ?? null,
+            updatedAt: new Date(),
+          } as Prisma.ApiDocUpdateInput;
+          
           await prisma.apiDoc.update({
             where: { id: existing.id },
-            data: {
-              requestHeaders: capture.requestHeaders,
-              requestBody: capture.requestBody,
-              responseHeaders: capture.responseHeaders,
-              responseBody: capture.responseBody,
-              statusCode: capture.statusCode,
-              updatedAt: new Date(),
-            },
+            data: updateData,
           });
           
           // 如果还没有文档，自动触发文档生成
@@ -75,18 +77,19 @@ export async function captureApi(req: Request, res: Response): Promise<void> {
           results.push({ id: existing.id, action: 'updated' });
         } else {
           // 创建新记录
+          const createData = {
+            url: capture.url,
+            method: capture.method,
+            domain: capture.domain,
+            requestHeaders: (capture.requestHeaders ?? {}) as Prisma.InputJsonValue,
+            requestBody: (capture.requestBody ?? Prisma.JsonNull) as Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue,
+            responseBody: (capture.responseBody ?? Prisma.JsonNull) as Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue,
+            statusCode: capture.statusCode ?? null,
+            requestHash,
+          } as Prisma.ApiDocCreateInput;
+          
           const apiDoc = await prisma.apiDoc.create({
-            data: {
-              url: capture.url,
-              method: capture.method,
-              domain: capture.domain,
-              requestHeaders: capture.requestHeaders || {},
-              requestBody: capture.requestBody,
-              responseHeaders: capture.responseHeaders || {},
-              responseBody: capture.responseBody,
-              statusCode: capture.statusCode,
-              requestHash,
-            },
+            data: createData as Prisma.ApiDocCreateInput,
           });
           
           // 自动触发文档生成

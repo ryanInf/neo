@@ -9,13 +9,85 @@ import { validateRequired, validateArray } from '../utils/validation';
 /**
  * 创建技能
  * POST /api/skills
+ * 
+ * Body 参数：
+ * - domain: 域名（必需）
+ * - apiDocIds: API文档ID数组（AI编排时使用）
+ * - name: 技能名称（可选，AI编排时会自动生成）
+ * - description: 技能描述（可选，AI编排时会自动生成）
+ * - definition: 技能定义（手工创建时使用，包含 apiSequence 和 content）
  */
 export async function createSkill(req: Request, res: Response): Promise<void> {
   try {
-    const { domain, apiDocIds, name, description } = req.body;
+    const { domain, apiDocIds, name, description, definition } = req.body;
 
     // 输入验证
     validateRequired(domain, 'domain');
+
+    // 如果提供了 definition，则使用手工创建模式
+    if (definition) {
+      // 手工创建模式
+      validateRequired(name, 'name');
+      validateRequired(description, 'description');
+      
+      // 验证 definition 格式
+      if (!definition.format || definition.format !== 'javascript') {
+        throw new ValidationError('definition.format must be "javascript"');
+      }
+      if (!definition.content || typeof definition.content !== 'string') {
+        throw new ValidationError('definition.content must be a string');
+      }
+      if (!definition.apiSequence || !Array.isArray(definition.apiSequence)) {
+        throw new ValidationError('definition.apiSequence must be an array');
+      }
+
+      // 验证 apiSequence 中的 apiDocId 是否存在（仅验证非占位符的ID）
+      const apiDocIdsInSequence = definition.apiSequence
+        .map((api: any) => api.apiDocId)
+        .filter((id: string) => id && !id.startsWith('manual-') && !id.startsWith('placeholder-'));
+      
+      if (apiDocIdsInSequence.length > 0) {
+        const apiDocs = await prisma.apiDoc.findMany({
+          where: {
+            id: { in: apiDocIdsInSequence },
+            domain,
+          },
+          select: {
+            id: true,
+          },
+        });
+        
+        const existingIds = new Set(apiDocs.map(doc => doc.id));
+        for (const apiCall of definition.apiSequence) {
+          const apiDocId = apiCall.apiDocId;
+          if (apiDocId && 
+              !apiDocId.startsWith('manual-') && 
+              !apiDocId.startsWith('placeholder-') &&
+              !existingIds.has(apiDocId)) {
+            throw new NotFoundError('ApiDoc', apiDocId);
+          }
+        }
+      }
+
+      // 直接保存技能定义
+      const skill = await prisma.skill.create({
+        data: {
+          name,
+          description,
+          domain,
+          version: 1,
+          definition: definition as any,
+        },
+      });
+
+      res.json({
+        success: true,
+        data: skill,
+      });
+      return;
+    }
+
+    // AI 编排模式（原有逻辑）
     validateArray(apiDocIds, 'apiDocIds');
 
     // 使用 AI 编排技能
@@ -58,7 +130,7 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
     const code = generateSkillCode(finalName, finalDescription, orchestration.apiSequence, apiDocMap);
 
     // 创建技能定义
-    const definition = createSkillDefinition(orchestration.apiSequence, code);
+    const skillDefinition = createSkillDefinition(orchestration.apiSequence, code);
 
     // 保存到数据库
     const skill = await prisma.skill.create({
@@ -67,7 +139,7 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
         description: finalDescription,
         domain,
         version: 1,
-        definition: definition as unknown as Prisma.JsonValue,
+        definition: skillDefinition as any,
       },
     });
 
@@ -84,13 +156,35 @@ export async function createSkill(req: Request, res: Response): Promise<void> {
  * 查询技能列表
  * GET /api/skills
  */
+/**
+ * 提取主域名（去除 www 等子域名前缀）
+ */
+function getMainDomain(hostname: string): string {
+  // 移除 www. 前缀
+  let domain = hostname.replace(/^www\./, '');
+  
+  // 提取主域名（例如：www.xiaohongshu.com -> xiaohongshu.com）
+  const parts = domain.split('.');
+  if (parts.length >= 2) {
+    // 取最后两部分作为主域名（例如：xiaohongshu.com）
+    domain = parts.slice(-2).join('.');
+  }
+  
+  return domain;
+}
+
 export async function getSkills(req: Request, res: Response): Promise<void> {
   try {
     const { domain, limit = 50, offset = 0 } = req.query;
 
     const where: Record<string, any> = {};
     if (domain) {
-      where.domain = domain as string;
+      const mainDomain = getMainDomain(domain as string);
+      // 支持精确匹配或主域名匹配
+      where.OR = [
+        { domain: domain as string },
+        { domain: mainDomain }
+      ];
     }
 
     const limitNum = Number(limit);

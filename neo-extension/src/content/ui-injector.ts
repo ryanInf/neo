@@ -167,6 +167,24 @@ async function executeSkillInPage(skillId: string): Promise<void> {
 }
 
 /**
+ * 提取主域名（去除 www 等子域名前缀）
+ */
+function getMainDomain(hostname: string): string {
+  // 移除 www. 前缀
+  let domain = hostname.replace(/^www\./, '');
+  
+  // 提取主域名（例如：www.xiaohongshu.com -> xiaohongshu.com）
+  // 对于常见的二级域名，保留完整域名
+  const parts = domain.split('.');
+  if (parts.length >= 2) {
+    // 取最后两部分作为主域名（例如：xiaohongshu.com）
+    domain = parts.slice(-2).join('.');
+  }
+  
+  return domain;
+}
+
+/**
  * 注入技能 UI
  */
 export async function injectSkillUI(): Promise<void> {
@@ -175,10 +193,16 @@ export async function injectSkillUI(): Promise<void> {
     return;
   }
   
-  const domain = window.location.hostname;
+  const hostname = window.location.hostname;
+  const mainDomain = getMainDomain(hostname);
   
-  // 获取技能列表
-  const skills = await getSkillList(domain);
+  console.log('[Neo] Current hostname:', hostname);
+  console.log('[Neo] Main domain:', mainDomain);
+  
+  // 获取技能列表（使用主域名）
+  const skills = await getSkillList(mainDomain);
+  
+  console.log('[Neo] Found skills:', skills.length);
   
   if (skills.length === 0) {
     console.log('[Neo] No skills available for this domain');

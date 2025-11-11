@@ -29,7 +29,6 @@ export async function analyzeApiDoc(apiDocId: string): Promise<void> {
       method: apiDoc.method,
       requestHeaders: (apiDoc.requestHeaders as Record<string, string>) || {},
       requestBody: apiDoc.requestBody as Record<string, any> | undefined,
-      responseHeaders: (apiDoc.responseHeaders as Record<string, string>) || {},
       responseBody: apiDoc.responseBody as Record<string, any> | undefined,
       statusCode: apiDoc.statusCode || undefined,
     });
