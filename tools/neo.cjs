@@ -1786,6 +1786,132 @@ Options:
   }
 };
 
+// neo mock — generate a mock HTTP server from schema
+commands.mock = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  const domain = positional[0];
+  if (!domain) {
+    console.log(`Usage: neo mock <domain> [--port <port>] [--latency <ms>]
+
+Generate a local mock HTTP server from a domain's API schema.
+Returns realistic responses based on captured response body structures.
+
+Options:
+  --port <port>       Port to listen on (default: 3456)
+  --latency <ms>      Simulated response latency (default: 0)`);
+    return;
+  }
+
+  const port = parseInt(flags.port) || 3456;
+  const latency = parseInt(flags.latency) || 0;
+  const schemaPath = path.join(SCHEMA_DIR, `${domain}.json`);
+  if (!fs.existsSync(schemaPath)) {
+    console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+    process.exit(1);
+  }
+
+  const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf-8'));
+  const http = require('http');
+
+  // Generate mock value from type string
+  function mockValue(type, key) {
+    const lk = key.toLowerCase();
+    if (type === 'number') return lk.includes('count') || lk.includes('total') ? 42 : 3.14;
+    if (type === 'boolean') return true;
+    if (type === 'array') return [];
+    if (type === 'object') return {};
+    if (type === 'null') return null;
+    // string
+    if (lk.includes('id')) return 'mock-id-' + Math.random().toString(36).slice(2, 8);
+    if (lk.includes('url') || lk.includes('href')) return 'https://example.com/mock';
+    if (lk.includes('name')) return 'Mock Name';
+    if (lk.includes('email')) return 'mock@example.com';
+    if (lk.includes('date') || lk.includes('time') || lk.includes('created') || lk.includes('updated')) return new Date().toISOString();
+    if (lk.includes('text') || lk.includes('body') || lk.includes('content') || lk.includes('description')) return 'Mock content';
+    if (lk.includes('title')) return 'Mock Title';
+    if (lk.includes('token') || lk.includes('key') || lk.includes('secret')) return 'mock-secret-xxxxx';
+    if (lk.includes('status') || lk.includes('state')) return 'active';
+    if (lk.includes('type') || lk.includes('kind')) return 'default';
+    return 'mock-' + key;
+  }
+
+  // Build mock response from responseBodyStructure
+  function buildMockBody(structure) {
+    if (!structure || typeof structure !== 'object') return { ok: true };
+    const result = {};
+    for (const [key, type] of Object.entries(structure)) {
+      if (typeof type === 'object' && type !== null) {
+        result[key] = buildMockBody(type);
+      } else {
+        result[key] = mockValue(String(type), key);
+      }
+    }
+    return result;
+  }
+
+  // Build route table: { "GET /path": endpoint }
+  const routes = new Map();
+  for (const ep of schema.endpoints || []) {
+    // Convert parameterized paths to regex
+    const pathRegex = ep.path
+      .replace(/:[a-zA-Z_]+/g, '[^/]+')
+      .replace(/\*/g, '.*');
+    routes.set(`${ep.method} ${pathRegex}`, {
+      ...ep,
+      regex: new RegExp('^' + pathRegex + '(\\?.*)?$'),
+    });
+  }
+
+  const server = http.createServer((req, res) => {
+    const method = req.method;
+    const urlPath = req.url;
+
+    // CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    if (method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+    // Find matching route
+    let matched = null;
+    for (const [, ep] of routes) {
+      if (ep.method === method && ep.regex.test(urlPath)) {
+        matched = ep;
+        break;
+      }
+    }
+
+    const respond = () => {
+      if (matched) {
+        const status = Object.keys(matched.statusCodes || {})[0] || 200;
+        const body = buildMockBody(matched.responseBodyStructure);
+        res.writeHead(parseInt(status), { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body, null, 2));
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found', availableRoutes: schema.endpoints.map(e => `${e.method} ${e.path}`) }));
+      }
+    };
+
+    if (latency > 0) {
+      setTimeout(respond, latency);
+    } else {
+      respond();
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`Neo mock server for ${domain}`);
+    console.log(`Listening on http://localhost:${port}`);
+    console.log(`${routes.size} routes from schema\n`);
+    for (const [, ep] of routes) {
+      const status = Object.keys(ep.statusCodes || {})[0] || 200;
+      console.log(`  ${ep.method.padEnd(6)} ${ep.path}  → ${status}`);
+    }
+    console.log(`\nPress Ctrl+C to stop`);
+  });
+};
+
 // neo tabs — list open Chrome tabs
 commands.tabs = async function(args) {
   const { positional } = parseArgs(args || []);
@@ -1899,6 +2025,7 @@ Commands:
   neo tabs [filter]                       List open Chrome tabs
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
+  neo mock <domain> [--port N]            Generate mock server from schema
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
   neo doctor                              Diagnose setup issues
   neo reload                              Reload the Neo extension

@@ -292,5 +292,78 @@ test('handles empty/null input', () => {
   assert.strictEqual(neoToJsonSchema(null).type, 'object');
   assert.strictEqual(neoToJsonSchema(undefined).type, 'object');
 });
+
+// ─── Mock value generation ──────────────────────────────────────
+
+function mockValue(type, key) {
+  if (type === 'number') return key.includes('count') || key.includes('total') ? 42 : 3.14;
+  if (type === 'boolean') return true;
+  if (type === 'array') return [];
+  if (type === 'object') return {};
+  if (type === 'null') return null;
+  if (key.includes('id')) return 'mock-id-' + Math.random().toString(36).slice(2, 8);
+  if (key.includes('url') || key.includes('href')) return 'https://example.com/mock';
+  if (key.includes('name')) return 'Mock Name';
+  if (key.includes('email')) return 'mock@example.com';
+  if (key.includes('date') || key.includes('time') || key.includes('At')) return new Date().toISOString();
+  if (key.includes('text') || key.includes('body') || key.includes('content')) return 'Mock content';
+  if (key.includes('title')) return 'Mock Title';
+  return 'mock-' + key;
+}
+
+function buildMockBody(structure) {
+  if (!structure || typeof structure !== 'object') return { ok: true };
+  const result = {};
+  for (const [key, type] of Object.entries(structure)) {
+    if (typeof type === 'object' && type !== null) {
+      result[key] = buildMockBody(type);
+    } else {
+      result[key] = mockValue(String(type), key);
+    }
+  }
+  return result;
+}
+
+console.log('\n── Mock value generation ──');
+
+test('mockValue returns number for count fields', () => {
+  assert.strictEqual(mockValue('number', 'totalCount'), 42);
+  assert.strictEqual(mockValue('number', 'price'), 3.14);
+});
+
+test('mockValue returns boolean', () => {
+  assert.strictEqual(mockValue('boolean', 'active'), true);
+});
+
+test('mockValue returns typed strings', () => {
+  assert.ok(mockValue('string', 'user_id').startsWith('mock-id-'));
+  assert.strictEqual(mockValue('string', 'profile_url'), 'https://example.com/mock');
+  assert.strictEqual(mockValue('string', 'display_name'), 'Mock Name');
+  assert.strictEqual(mockValue('string', 'email'), 'mock@example.com');
+  assert.strictEqual(mockValue('string', 'title'), 'Mock Title');
+});
+
+test('mockValue returns null for null type', () => {
+  assert.strictEqual(mockValue('null', 'field'), null);
+});
+
+test('buildMockBody handles flat structure', () => {
+  const body = buildMockBody({ count: 'number', active: 'boolean', name: 'string' });
+  assert.strictEqual(body.count, 42);
+  assert.strictEqual(body.active, true);
+  assert.strictEqual(body.name, 'Mock Name');
+});
+
+test('buildMockBody handles nested structure', () => {
+  const body = buildMockBody({ user: { name: 'string', id: 'string' } });
+  assert.strictEqual(body.user.name, 'Mock Name');
+  assert.ok(body.user.id.startsWith('mock-id-'));
+});
+
+test('buildMockBody handles null/undefined input', () => {
+  assert.deepStrictEqual(buildMockBody(null), { ok: true });
+  assert.deepStrictEqual(buildMockBody(undefined), { ok: true });
+});
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail > 0 ? 1 : 0);
