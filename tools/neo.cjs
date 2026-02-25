@@ -259,6 +259,43 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'watch': {
+      const domain = positional[1];
+      console.error(`Watching captures${domain ? ' for ' + domain : ''}... (Ctrl+C to stop)`);
+      let lastTimestamp = Date.now();
+      const poll = async () => {
+        try {
+          const r = await cdpEval(wsUrl, dbEval(`
+            var rows = [];
+            var domain = ${domain ? JSON.stringify(domain) : 'null'};
+            var since = ${lastTimestamp};
+            store.openCursor(null, "prev").onsuccess = function(e) {
+              var c = e.target.result;
+              if (c) {
+                var v = c.value;
+                if (v.timestamp <= since) { resolve(JSON.stringify(rows)); return; }
+                if (!domain || v.domain === domain) {
+                  rows.push({ method: v.method, status: v.responseStatus, url: v.url, duration: v.duration, timestamp: v.timestamp });
+                }
+                c.continue();
+              } else { resolve(JSON.stringify(rows)); }
+            };
+          `));
+          const items = JSON.parse(r);
+          for (const item of items.reverse()) {
+            const time = new Date(item.timestamp).toLocaleTimeString();
+            console.log(`${time}  ${item.method} ${item.status} ${item.url.slice(0, 100)} (${item.duration}ms)`);
+            if (item.timestamp > lastTimestamp) lastTimestamp = item.timestamp;
+          }
+        } catch {}
+      };
+      await poll();
+      const interval = setInterval(poll, 2000);
+      process.on('SIGINT', () => { clearInterval(interval); process.exit(0); });
+      await new Promise(() => {}); // Block forever
+      break;
+    }
+
     default:
       console.log(`neo capture — Manage captured API traffic
 
@@ -267,7 +304,8 @@ commands.capture = async function(args) {
   neo capture domains                     List domains with counts
   neo capture detail <id>                 Show full capture details
   neo capture clear [domain]              Clear captures (all or by domain)
-  neo capture export [domain]             Export captures as JSON`);
+  neo capture export [domain]             Export captures as JSON
+  neo capture watch [domain]              Live tail of new captures`);
   }
 };
 
