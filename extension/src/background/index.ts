@@ -65,8 +65,8 @@ async function hydrateCounts(): Promise<void> {
 }
 
 async function refreshBadge(tabId?: number): Promise<void> {
-  const targetTabId = typeof tabId === 'number' ? tabId : await getActiveTabId();
-  if (typeof targetTabId !== 'number') {
+  const targetTabId = typeof tabId === 'number' && tabId > 0 ? tabId : await getActiveTabId();
+  if (typeof targetTabId !== 'number' || targetTabId < 0) {
     return;
   }
 
