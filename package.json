@@ -16,5 +16,8 @@
     "@types/node": "^22.10.5",
     "typescript": "^5.8.2",
     "vite": "^6.0.0"
+  },
+  "bin": {
+    "neo": "tools/neo.cjs"
   }
 }
