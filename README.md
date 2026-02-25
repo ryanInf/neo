@@ -92,6 +92,9 @@ node tools/neo.cjs open https://example.com
 │  inject/interceptor.ts               │
 │    ├─ Monkey-patches fetch & XHR     │
 │    ├─ Intercepts WebSocket traffic   │
+│    ├─ Intercepts EventSource/SSE     │
+│    ├─ Tracks DOM triggers (click →   │
+│    │   API correlation)              │
 │    ├─ Records full request/response  │
 │    └─ Correlates with DOM events     │
 │                                      │
@@ -107,9 +110,10 @@ node tools/neo.cjs open https://example.com
                │ Chrome DevTools Protocol (port 9222)
 ┌──────────────┴──────────────────────┐
 │  CLI: tools/neo.cjs (Node.js)        │
-│  ├─ neo capture → read/export data   │
+│  ├─ neo capture → read/export/search  │
 │  ├─ neo schema  → analyze → schema   │
 │  ├─ neo exec    → execute in browser │
+│  ├─ neo replay  → re-run captured    │
 │  ├─ neo eval    → run JS in tab      │
 │  └─ neo read    → extract page text  │
 └──────────────┬──────────────────────┘
@@ -124,13 +128,42 @@ node tools/neo.cjs open https://example.com
 
 ## Real-World Demo
 
-Neo posted its own announcement tweet on X/Twitter:
+### Post a tweet via captured API
 
-1. Browsed X normally — Neo captured 655 API calls including the GraphQL `CreateTweet` mutation
-2. Extracted the endpoint structure, auth headers (Bearer token + CSRF), and required feature flags
-3. Called `CreateTweet` directly via CDP — tweet posted in <1 second, zero UI interaction
+```bash
+# 1. Browse X normally — Neo captures GraphQL mutations
+neo schema show api.x.com
 
-Then deleted it the same way via `DeleteTweet`. Full API control.
+# 2. Find the CreateTweet endpoint
+neo capture search "CreateTweet" --method POST
+
+# 3. Replay with the original auth (cookies inherited automatically)
+neo replay abc123 --tab x.com
+
+# 4. Or craft a new call with auto-detected auth headers
+neo exec "https://x.com/i/api/graphql/.../CreateTweet" \
+  --method POST --auto-headers \
+  --body '{"variables":{"tweet_text":"Hello from Neo!"},...}'
+```
+
+### Understand what a button does
+
+Neo's trigger tracking maps UI interactions to API calls:
+
+```bash
+neo schema show github.com
+# Output includes:
+#   POST /repos/:owner/:repo/star  (3x, 280ms)
+#     ← click button.js-social-form "Star" (3x)
+```
+
+### Live-monitor API traffic
+
+```bash
+neo capture watch api.openai.com
+# 14:23:01  POST 200 /v1/chat/completions (1230ms)
+# 14:23:05  SSE_MSG 200 /v1/chat/completions (0ms) [sse]
+```
 
 ## Storage
 
