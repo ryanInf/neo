@@ -29,21 +29,33 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 // ─── CDP Helpers ────────────────────────────────────────────────
 
 async function findExtensionWs() {
-  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+  let tabs;
+  try {
+    const resp = await fetch(`${CDP_URL}/json/list`);
+    tabs = await resp.json();
+  } catch (err) {
+    throw new Error(`Cannot connect to Chrome DevTools at ${CDP_URL}. Is Chrome running with --remote-debugging-port=9222?`);
+  }
   const sw = tabs.find(t => t.url.includes(NEO_EXTENSION_ID));
-  if (!sw) throw new Error('Neo extension service worker not found. Is it installed and active?');
+  if (!sw) throw new Error(`Neo extension service worker not found (ID: ${NEO_EXTENSION_ID}). Is the extension installed and enabled?`);
   return sw.webSocketDebuggerUrl;
 }
 
 async function findTab(pattern) {
-  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+  let tabs;
+  try {
+    const resp = await fetch(`${CDP_URL}/json/list`);
+    tabs = await resp.json();
+  } catch (err) {
+    throw new Error(`Cannot connect to Chrome DevTools at ${CDP_URL}. Is Chrome running with --remote-debugging-port=9222?`);
+  }
   if (pattern) {
     const tab = tabs.find(t => t.type === 'page' && t.url.includes(pattern));
-    if (!tab) throw new Error(`No tab matching "${pattern}"`);
+    if (!tab) throw new Error(`No tab matching "${pattern}". Open tabs: ${tabs.filter(t => t.type === 'page').map(t => t.url).join(', ') || '(none)'}`);
     return tab;
   }
   const pages = tabs.filter(t => t.type === 'page');
-  if (!pages.length) throw new Error('No browser tabs found');
+  if (!pages.length) throw new Error('No browser tabs found. Open a page in Chrome first.');
   return pages[0];
 }
 
@@ -72,7 +84,7 @@ function cdpEval(wsUrl, expression, timeout = 30000) {
         }
       }
     });
-    ws.on('error', err => { clearTimeout(timer); reject(err); });
+    ws.on('error', err => { clearTimeout(timer); reject(new Error(`CDP WebSocket error: ${err.message}`)); });
   });
 }
 
