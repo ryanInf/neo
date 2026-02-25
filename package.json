@@ -7,7 +7,8 @@
     "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build && NEO_ENTRY=popup vite build"
   },
   "dependencies": {
-    "dexie": "^4.0.11"
+    "dexie": "^4.0.11",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.303",
