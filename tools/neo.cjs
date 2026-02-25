@@ -486,11 +486,26 @@ commands.schema = async function(args) {
       break;
     }
 
+    case 'list': {
+      if (!fs.existsSync(SCHEMA_DIR)) { console.log('No schemas generated yet.'); break; }
+      const files = fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json'));
+      if (!files.length) { console.log('No schemas generated yet.'); break; }
+      for (const f of files) {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, f), 'utf8'));
+          const age = Math.round((Date.now() - new Date(s.generatedAt).getTime()) / 3600000);
+          console.log(`${s.domain}  ${s.uniqueEndpoints} endpoints  ${s.totalCaptures} captures  ${age}h ago`);
+        } catch { console.log(f); }
+      }
+      break;
+    }
+
     default:
       console.log(`neo schema — API schema management
 
+  neo schema list                 List all cached schemas
   neo schema generate <domain>    Generate schema from captures (saves to skill dir)
-  neo schema show <domain>        Show cached schema`);
+  neo schema show <domain>        Show cached schema (--json for raw)`);
   }
 };
 
