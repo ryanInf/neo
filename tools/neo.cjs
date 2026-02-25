@@ -488,6 +488,70 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'gc': {
+      // Smart garbage collection: keep one capture per unique (method, path pattern, status) combo per domain
+      // Keeps the most recent of each unique pattern
+      const domain = positional[1];
+      const dryRun = flags['dry-run'] || flags.dryrun;
+      const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
+        var req = indexedDB.open("${DB_NAME}");
+        req.onsuccess = function() {
+          var db = req.result;
+          var tx = db.transaction("${STORE_NAME}", ${dryRun ? '"readonly"' : '"readwrite"'});
+          var store = tx.objectStore("${STORE_NAME}");
+          var seen = {};  // key → {id, timestamp}
+          var toDelete = [];
+          var domain = ${domain ? JSON.stringify(domain) : 'null'};
+          store.openCursor().onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) {
+              var v = c.value;
+              if (domain && v.domain !== domain) { c.continue(); return; }
+              // Build pattern key: method + pathname (sans query) + status
+              var pathname = '/';
+              try { pathname = new URL(v.url).pathname; } catch(e) {}
+              // Parameterize: replace UUIDs, numeric IDs, hashes
+              pathname = pathname.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
+              pathname = pathname.replace(/\\/\\d{4,}/g, '/:id');
+              var key = v.method + ' ' + v.domain + pathname + ' ' + (v.responseStatus || '?');
+              if (!seen[key] || v.timestamp > seen[key].timestamp) {
+                if (seen[key]) toDelete.push(seen[key].id);
+                seen[key] = { id: c.key, timestamp: v.timestamp };
+              } else {
+                toDelete.push(c.key);
+              }
+              c.continue();
+            } else {
+              ${dryRun ? '' : `
+              var deleted = 0;
+              if (toDelete.length === 0) { resolve(JSON.stringify({kept: Object.keys(seen).length, deleted: 0})); return; }
+              for (var i = 0; i < toDelete.length; i++) {
+                store.delete(toDelete[i]).onsuccess = function() {
+                  deleted++;
+                  if (deleted === toDelete.length) {
+                    resolve(JSON.stringify({kept: Object.keys(seen).length, deleted: deleted}));
+                  }
+                };
+              }
+              `}
+              ${dryRun ? 'resolve(JSON.stringify({kept: Object.keys(seen).length, wouldDelete: toDelete.length}));' : ''}
+            }
+          };
+          tx.onerror = function() { resolve("Error: " + tx.error); };
+        };
+        req.onerror = function() { resolve("Error: " + req.error); };
+      })`, 60000);
+      try {
+        const result = JSON.parse(r);
+        if (dryRun) {
+          console.log(`[dry-run] Would keep ${result.kept} unique patterns, delete ${result.wouldDelete} duplicates`);
+        } else {
+          console.log(`Kept ${result.kept} unique patterns, deleted ${result.deleted} duplicates`);
+        }
+      } catch { console.log(r); }
+      break;
+    }
+
     default:
       console.log(`neo capture — Manage captured API traffic
 
@@ -502,7 +566,8 @@ commands.capture = async function(args) {
   neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures
   neo capture summary                     Quick overview for AI agents
-  neo capture prune [--older-than 7d]     Delete old captures`);
+  neo capture prune [--older-than 7d]     Delete old captures
+  neo capture gc [domain] [--dry-run]     Smart dedup: keep one per unique pattern`);
   }
 };
 
