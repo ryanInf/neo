@@ -1,5 +1,5 @@
 import { CapturedRequest, MAX_CAPTURE_BODY_BYTES, NEO_CAPTURE_MESSAGE_TYPE } from '../types';
-import { normalizeCaptureValue } from '../db';
+import { normalizeCaptureValue } from '../utils';
 
 const STATIC_RESOURCE_EXTENSIONS = /\.(?:js|css|png|jpe?g|gif|webp|ico|svg|woff2?|eot|ttf|otf|map)(?:[?#].*)?$/i;
 const ANALYTICS_KEYWORDS = ['google-analytics', 'sentry', 'hotjar', 'mixpanel', 'segment'];
