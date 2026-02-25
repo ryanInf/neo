@@ -992,13 +992,133 @@ commands.schema = async function(args) {
       break;
     }
 
+    case 'openapi': {
+      // Convert Neo schema to OpenAPI 3.0 spec
+      const domain = positional[1];
+      if (!domain) { console.error('Usage: neo schema openapi <domain>'); process.exit(1); }
+      const file = path.join(SCHEMA_DIR, `${domain}.json`);
+      if (!fs.existsSync(file)) {
+        console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+        process.exit(1);
+      }
+      const schema = JSON.parse(fs.readFileSync(file, 'utf8'));
+      
+      // Convert Neo type structure to JSON Schema
+      function neoToJsonSchema(struct) {
+        if (!struct || typeof struct !== 'object') return { type: 'object' };
+        if (Array.isArray(struct)) {
+          return { type: 'array', items: struct.length ? neoToJsonSchema(struct[0]) : {} };
+        }
+        const properties = {};
+        for (const [k, v] of Object.entries(struct)) {
+          if (typeof v === 'string') {
+            properties[k] = v === 'null' ? {} : { type: v };
+          } else if (typeof v === 'object') {
+            properties[k] = neoToJsonSchema(v);
+          }
+        }
+        return { type: 'object', properties };
+      }
+      
+      // Build OpenAPI paths
+      const paths = {};
+      for (const ep of schema.endpoints) {
+        const oaPath = ep.path.replace(/:uuid/g, '{uuid}').replace(/:id/g, '{id}').replace(/:hash/g, '{hash}');
+        if (!paths[oaPath]) paths[oaPath] = {};
+        
+        const method = ep.method.toLowerCase();
+        if (method.startsWith('ws_') || method.startsWith('sse_')) continue;
+        
+        const operation = {
+          summary: `${ep.category || method} — ${ep.callCount}x observed`,
+          tags: [ep.category || 'default'],
+        };
+        
+        // Query parameters
+        if (ep.queryParams?.length) {
+          operation.parameters = ep.queryParams.map(p => ({
+            name: p, in: 'query', schema: { type: 'string' },
+          }));
+        }
+        
+        // Path parameters
+        const pathParams = oaPath.match(/\{(\w+)\}/g);
+        if (pathParams) {
+          operation.parameters = [
+            ...(operation.parameters || []),
+            ...pathParams.map(p => ({
+              name: p.slice(1, -1), in: 'path', required: true, schema: { type: 'string' },
+            })),
+          ];
+        }
+        
+        // Security
+        if (ep.authHeaders?.length) {
+          operation.security = [{ apiKey: [] }];
+        }
+        
+        // Request body
+        if (ep.requestBodyStructure && ['post', 'put', 'patch'].includes(method)) {
+          operation.requestBody = {
+            content: { 'application/json': { schema: neoToJsonSchema(ep.requestBodyStructure) } },
+          };
+        }
+        
+        // Responses
+        const responses = {};
+        for (const [code, count] of Object.entries(ep.statusCodes || {})) {
+          responses[code] = {
+            description: `${count}x observed`,
+            ...(ep.responseBodyStructure && parseInt(code) >= 200 && parseInt(code) < 300
+              ? { content: { 'application/json': { schema: neoToJsonSchema(ep.responseBodyStructure) } } }
+              : {}),
+          };
+        }
+        operation.responses = Object.keys(responses).length ? responses : { '200': { description: 'OK' } };
+        
+        paths[oaPath][method] = operation;
+      }
+      
+      // Security schemes
+      const allAuthHeaders = new Set();
+      for (const ep of schema.endpoints) {
+        for (const h of (ep.authHeaders || [])) allAuthHeaders.add(h);
+      }
+      const components = {};
+      if (allAuthHeaders.size) {
+        components.securitySchemes = {
+          apiKey: {
+            type: 'apiKey', in: 'header',
+            name: [...allAuthHeaders][0],
+            description: `Auth headers: ${[...allAuthHeaders].join(', ')}`,
+          },
+        };
+      }
+      
+      const openapi = {
+        openapi: '3.0.3',
+        info: {
+          title: `${domain} API (discovered by Neo)`,
+          description: `Auto-generated from ${schema.totalCaptures} captured API calls across ${schema.uniqueEndpoints} endpoints.`,
+          version: `${schema.version || 1}.0.0`,
+        },
+        servers: [{ url: `https://${domain}` }],
+        paths,
+        ...(Object.keys(components).length ? { components } : {}),
+      };
+      
+      console.log(JSON.stringify(openapi, null, 2));
+      break;
+    }
+
     default:
       console.log(`neo schema — API schema management
 
   neo schema list                 List all cached schemas
   neo schema generate <domain>    Generate schema from captures (--all for all domains)
   neo schema show <domain>        Show cached schema (--json for raw)
-  neo schema search <query>       Search all schemas for matching endpoints`);
+  neo schema search <query>       Search all schemas for matching endpoints
+  neo schema openapi <domain>     Export as OpenAPI 3.0 spec`);
   }
 };
 
