@@ -94,6 +94,17 @@ function dbEval(body) {
   })`;
 }
 
+// ─── Helpers ────────────────────────────────────────────────────
+
+/** Parse duration strings like "1h", "30m", "2d" into milliseconds */
+function parseDuration(str) {
+  const m = String(str).match(/^(\d+)\s*(s|m|h|d)$/);
+  if (!m) return parseInt(str) || 0;
+  const n = parseInt(m[1]);
+  const unit = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2]];
+  return n * unit;
+}
+
 // ─── CLI Parsing ────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -171,14 +182,17 @@ commands.capture = async function(args) {
     case 'list': {
       const domain = positional[1];
       const limit = parseInt(flags.limit) || 20;
+      const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
       const r = await cdpEval(wsUrl, dbEval(`
-        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, limit = ${limit};
+        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, limit = ${limit}, since = ${since};
         store.openCursor(null, "prev").onsuccess = function(e) {
           var c = e.target.result;
           if (c && rows.length < limit) {
             var v = c.value;
+            if (since && v.timestamp < since) { resolve(rows.join("\\n")); return; }
             if (!domain || v.domain === domain) {
-              rows.push(v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)");
+              var src = v.source === 'websocket' ? ' [ws]' : v.source === 'eventsource' ? ' [sse]' : '';
+              rows.push(v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)" + src);
             }
             c.continue();
           } else { resolve(rows.join("\\n")); }
@@ -241,12 +255,14 @@ commands.capture = async function(args) {
 
     case 'export': {
       const domain = positional[1];
+      const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
       const r = await cdpEval(wsUrl, dbEval(`
-        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'};
+        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
         store.openCursor().onsuccess = function(e) {
           var c = e.target.result;
           if (c) {
             var v = c.value;
+            if (since && v.timestamp < since) { c.continue(); return; }
             if (!domain || v.domain === domain) {
               if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 2000)
                 v.responseBody = v.responseBody.slice(0, 2000) + "...[truncated]";
@@ -411,7 +427,7 @@ commands.capture = async function(args) {
   neo capture detail <id>                 Show full capture details
   neo capture search <query>              Search captures by URL (--method, --status, --limit)
   neo capture clear [domain]              Clear captures (all or by domain)
-  neo capture export [domain]             Export captures as JSON
+  neo capture export [domain] [--since 1h] Export captures as JSON
   neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures`);
   }
@@ -475,7 +491,9 @@ commands.schema = async function(args) {
           }
           var total = 0;
           var authKeys = ['authorization', 'x-csrf-token', 'x-twitter-auth-type',
-            'x-requested-with', 'x-github-client-version'];
+            'x-requested-with', 'x-github-client-version', 'x-client-transaction-id',
+            'x-twitter-active-user', 'x-twitter-client-language', 'x-fetch-nonce',
+            'github-verified-fetch', 'x-api-key', 'api-key'];
           
           idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
             var c = e.target.result;
@@ -492,11 +510,13 @@ commands.schema = async function(args) {
                     headers: {}, durations: [], count: 0, responseType: null,
                     bodyKeys: null,
                     responseKeys: null,
-                    triggers: {}
+                    triggers: {},
+                    sources: {}
                   };
                 }
                 var ep = endpoints[key];
                 ep.count++;
+                ep.sources[v.source || 'fetch'] = (ep.sources[v.source || 'fetch'] || 0) + 1;
                 u.searchParams.forEach(function(val, k) { ep.queryParams[k] = true; });
                 ep.statusCodes[v.responseStatus] = (ep.statusCodes[v.responseStatus] || 0) + 1;
                 if (v.duration) ep.durations.push(v.duration);
@@ -525,8 +545,8 @@ commands.schema = async function(args) {
                 var rh = v.requestHeaders || {};
                 for (var hk in rh) {
                   var lk = hk.toLowerCase();
-                  if (authKeys.some(function(ak) { return lk.indexOf(ak.replace(/-/g, '')) >= 0 || lk === ak; })) {
-                    ep.headers[hk] = rh[hk];
+                  if (authKeys.indexOf(lk) >= 0 || lk.startsWith('x-csrf') || lk.startsWith('x-api')) {
+                    ep.headers[hk] = true;  // Track header name only
                   }
                 }
                 var ct = (v.responseHeaders || {})['content-type'] || '';
@@ -564,6 +584,7 @@ commands.schema = async function(args) {
                       ? Object.keys(ep.headers)  // Only store header NAMES, not values
                       : undefined,
                     responseType: ep.responseType,
+                    source: Object.keys(ep.sources).length === 1 ? Object.keys(ep.sources)[0] : ep.sources,
                     requestBodyStructure: ep.bodyKeys || undefined,
                     responseBodyStructure: ep.responseKeys || undefined,
                     triggers: Object.keys(ep.triggers).length
