@@ -491,7 +491,8 @@ commands.schema = async function(args) {
                     queryParams: {}, statusCodes: {},
                     headers: {}, durations: [], count: 0, responseType: null,
                     bodyKeys: null,
-                    responseKeys: null
+                    responseKeys: null,
+                    triggers: {}
                   };
                 }
                 var ep = endpoints[key];
@@ -532,6 +533,14 @@ commands.schema = async function(args) {
                 if (ct.indexOf('json') >= 0) ep.responseType = 'json';
                 else if (ct.indexOf('html') >= 0) ep.responseType = 'html';
                 else if (ct.indexOf('text') >= 0) ep.responseType = 'text';
+                // Aggregate trigger info
+                if (v.trigger && v.trigger.selector) {
+                  var tKey = v.trigger.event + ' ' + v.trigger.selector;
+                  if (!ep.triggers[tKey]) {
+                    ep.triggers[tKey] = { event: v.trigger.event, selector: v.trigger.selector, text: v.trigger.text, count: 0 };
+                  }
+                  ep.triggers[tKey].count++;
+                }
               } catch(ex) {}
               c.continue();
             } else {
@@ -556,7 +565,10 @@ commands.schema = async function(args) {
                       : undefined,
                     responseType: ep.responseType,
                     requestBodyStructure: ep.bodyKeys || undefined,
-                    responseBodyStructure: ep.responseKeys || undefined
+                    responseBodyStructure: ep.responseKeys || undefined,
+                    triggers: Object.keys(ep.triggers).length
+                      ? Object.values(ep.triggers).sort(function(a,b){ return b.count - a.count; }).slice(0, 5)
+                      : undefined
                   };
                 })
               };
@@ -602,6 +614,11 @@ commands.schema = async function(args) {
           const params = ep.queryParams?.length ? ` ?${ep.queryParams.join('&')}` : '';
           const body = ep.requestBodyStructure ? ` body:{${Object.keys(ep.requestBodyStructure).join(', ')}}` : '';
           console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}`);
+          if (ep.triggers?.length) {
+            for (const t of ep.triggers) {
+              console.log(`    ← ${t.event} ${t.selector}${t.text ? ' "' + t.text + '"' : ''} (${t.count}x)`);
+            }
+          }
         }
       }
       break;
