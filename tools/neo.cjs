@@ -866,12 +866,36 @@ commands.schema = async function(args) {
       break;
     }
 
+    case 'search': {
+      const query = positional.slice(1).join(' ').toLowerCase();
+      if (!query) { console.error('Usage: neo schema search <query>'); process.exit(1); }
+      if (!fs.existsSync(SCHEMA_DIR)) { console.log('No schemas.'); break; }
+      const files = fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json'));
+      let found = 0;
+      for (const f of files) {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, f), 'utf8'));
+          for (const ep of (s.endpoints || [])) {
+            const searchable = `${ep.method} ${ep.path} ${(ep.queryParams || []).join(' ')} ${ep.category || ''}`.toLowerCase();
+            if (searchable.includes(query)) {
+              const cat = ep.category ? ` (${ep.category})` : '';
+              console.log(`${s.domain}  ${ep.method} ${ep.path}  (${ep.callCount}x)${cat}`);
+              found++;
+            }
+          }
+        } catch {}
+      }
+      if (!found) console.log(`No endpoints matching "${query}" across ${files.length} schemas`);
+      break;
+    }
+
     default:
       console.log(`neo schema — API schema management
 
   neo schema list                 List all cached schemas
   neo schema generate <domain>    Generate schema from captures (saves to skill dir)
-  neo schema show <domain>        Show cached schema (--json for raw)`);
+  neo schema show <domain>        Show cached schema (--json for raw)
+  neo schema search <query>       Search all schemas for matching endpoints`);
   }
 };
 
@@ -1556,7 +1580,7 @@ Commands:
   neo status                              Overview of captured data
   neo capture list|count|domains|detail|search|stats|summary|prune|clear|export|import
                                           Manage captured API traffic
-  neo schema generate|show <domain>       API schema management
+  neo schema generate|show|search <domain>  API schema management
   neo exec <url> [options]                Execute fetch in browser context
   neo replay <id> [--tab pattern]         Replay a captured API call
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
