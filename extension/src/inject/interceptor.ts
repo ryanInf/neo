@@ -14,6 +14,15 @@ const ANALYTICS_KEYWORDS = [
   // Media CDNs (not API calls)
   'video.twimg.com', 'abs.twimg.com', 'pbs.twimg.com',
   'googlevideo.com', 'ytimg.com',
+  // More CDNs
+  'cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com',
+  'fonts.googleapis.com', 'fonts.gstatic.com',
+  // More analytics/ads
+  'analytics.google.com', 'stats.g.doubleclick.net',
+  'pagead2.googlesyndication.com', 'adservice.google.com',
+  'static.cloudflareinsights.com', 'rum.browser-intake-datadoghq.com',
+  'app.launchdarkly.com', 'events.launchdarkly.com',
+  'api.statsig.com', 'featuregates.org',
 ];
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
