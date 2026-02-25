@@ -330,6 +330,22 @@ commands.schema = async function(args) {
           var idx = store.index("domain");
           var endpoints = {};
           
+          // Extract key structure from an object (depth limited)
+          function extractKeys(obj, maxDepth) {
+            if (maxDepth <= 0 || !obj || typeof obj !== 'object') return typeof obj;
+            if (Array.isArray(obj)) return obj.length > 0 ? [extractKeys(obj[0], maxDepth - 1)] : [];
+            var result = {};
+            for (var k in obj) {
+              if (obj.hasOwnProperty(k)) {
+                var v = obj[k];
+                if (v === null) result[k] = 'null';
+                else if (typeof v === 'object') result[k] = extractKeys(v, maxDepth - 1);
+                else result[k] = typeof v;
+              }
+            }
+            return result;
+          }
+          
           // Normalize paths: collapse variable segments (hashes, IDs, UUIDs)
           function normalizePath(p) {
             return p.split('/').map(function(seg) {
@@ -365,7 +381,8 @@ commands.schema = async function(args) {
                   endpoints[key] = {
                     method: v.method, path: normalizePath(u.pathname),
                     queryParams: {}, statusCodes: {},
-                    headers: {}, durations: [], count: 0, responseType: null
+                    headers: {}, durations: [], count: 0, responseType: null,
+                    bodyKeys: null
                   };
                 }
                 var ep = endpoints[key];
@@ -373,6 +390,17 @@ commands.schema = async function(args) {
                 u.searchParams.forEach(function(val, k) { ep.queryParams[k] = true; });
                 ep.statusCodes[v.responseStatus] = (ep.statusCodes[v.responseStatus] || 0) + 1;
                 if (v.duration) ep.durations.push(v.duration);
+                
+                // Extract request body structure (keys only, first occurrence)
+                if (!ep.bodyKeys && v.requestBody) {
+                  try {
+                    var bodyStr = typeof v.requestBody === 'string' ? v.requestBody : JSON.stringify(v.requestBody);
+                    var bodyObj = JSON.parse(bodyStr);
+                    if (bodyObj && typeof bodyObj === 'object') {
+                      ep.bodyKeys = extractKeys(bodyObj, 2);
+                    }
+                  } catch(ex2) {}
+                }
                 var rh = v.requestHeaders || {};
                 for (var hk in rh) {
                   var lk = hk.toLowerCase();
@@ -406,7 +434,8 @@ commands.schema = async function(args) {
                     authHeaders: Object.keys(ep.headers).length
                       ? Object.keys(ep.headers)  // Only store header NAMES, not values
                       : undefined,
-                    responseType: ep.responseType
+                    responseType: ep.responseType,
+                    requestBodyStructure: ep.bodyKeys || undefined
                   };
                 })
               };
