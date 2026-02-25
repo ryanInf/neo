@@ -11,7 +11,7 @@
 //   neo capture clear [domain]              Clear captures
 //   neo capture export [domain]             Export captures as JSON
 //   neo capture import <file>               Import captures from JSON file
-//   neo schema generate <domain>            Generate API schema from captures
+//   neo schema generate <domain> [--all]     Generate API schema from captures
 //   neo schema show <domain>                Show cached schema
 //   neo exec <url> [options]                Execute fetch in browser tab context
 //   neo eval <js> --tab <pattern>           Evaluate JS in page context
@@ -587,7 +587,56 @@ commands.schema = async function(args) {
   switch (action) {
     case 'generate': {
       const domain = positional[1];
-      if (!domain) { console.error('Usage: neo schema generate <domain>'); process.exit(1); }
+      
+      // --all: generate schemas for all domains with captures
+      if (flags.all || domain === '--all') {
+        const wsUrl = await findExtensionWs();
+        const domainsJson = await cdpEval(wsUrl, `new Promise(function(resolve) {
+          var req = indexedDB.open("${DB_NAME}");
+          req.onsuccess = function() {
+            var db = req.result;
+            var tx = db.transaction("${STORE_NAME}", "readonly");
+            var store = tx.objectStore("${STORE_NAME}");
+            var idx = store.index("domain");
+            var domains = {};
+            idx.openKeyCursor().onsuccess = function(e) {
+              var c = e.target.result;
+              if (c) { domains[c.key] = (domains[c.key] || 0) + 1; c.continue(); }
+              else { resolve(JSON.stringify(domains)); }
+            };
+          };
+          req.onerror = function() { resolve('{}'); };
+        })`, 10000);
+        
+        const domainCounts = JSON.parse(domainsJson || '{}');
+        const domainList = Object.entries(domainCounts)
+          .filter(([, count]) => count >= 2)  // skip domains with only 1 capture
+          .sort((a, b) => b[1] - a[1]);
+        
+        if (!domainList.length) { console.error('No domains with enough captures'); process.exit(1); }
+        
+        console.error(`Generating schemas for ${domainList.length} domains...\n`);
+        let generated = 0, skipped = 0;
+        
+        // Re-run the command for each domain by recursing into the switch
+        for (const [d, count] of domainList) {
+          process.stdout.write(`  ${d} (${count} captures)... `);
+          try {
+            // Inline the single-domain generation (call the same CLI)
+            const { execSync } = require('child_process');
+            execSync(`node ${__filename} schema generate ${d} --json`, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 40000 });
+            console.log('✓');
+            generated++;
+          } catch (e) {
+            console.log('✗');
+            skipped++;
+          }
+        }
+        console.error(`\nDone: ${generated} generated, ${skipped} skipped`);
+        break;
+      }
+      
+      if (!domain) { console.error('Usage: neo schema generate <domain> | neo schema generate --all'); process.exit(1); }
       
       const wsUrl = await findExtensionWs();
       // Run schema analysis INSIDE the browser to avoid transferring raw captures
@@ -893,7 +942,7 @@ commands.schema = async function(args) {
       console.log(`neo schema — API schema management
 
   neo schema list                 List all cached schemas
-  neo schema generate <domain>    Generate schema from captures (saves to skill dir)
+  neo schema generate <domain>    Generate schema from captures (--all for all domains)
   neo schema show <domain>        Show cached schema (--json for raw)
   neo schema search <query>       Search all schemas for matching endpoints`);
   }
