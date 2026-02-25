@@ -2,6 +2,8 @@ export const NEO_MESSAGE_PREFIX = '__neo_';
 export const NEO_CAPTURE_MESSAGE_TYPE = `${NEO_MESSAGE_PREFIX}capture_request`;
 export const NEO_BADGE_REFRESH_MESSAGE_TYPE = `${NEO_MESSAGE_PREFIX}badge_refresh`;
 export const MAX_CAPTURE_BODY_BYTES = 100 * 1024;
+export const MAX_CAPTURES_PER_DOMAIN = 500;
+export const SCHEMA_BODY_MAX_BYTES = 2 * 1024; // For schema generation, keep bodies small
 
 export type TriggerEventType = 'click' | 'input' | 'submit';
 

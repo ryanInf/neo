@@ -169,7 +169,8 @@ async function run() {
     }
     
     default:
-      console.log('Usage: neo-query [count|domains|list|detail|clear]');
+      console.log('Usage: neo-query [count|domains|list|detail|clear|export]');
+      console.log('  export [domain]  — Export captures as JSON to stdout');
   }
 }
 
