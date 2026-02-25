@@ -756,8 +756,8 @@ commands.schema = async function(args) {
       if (fs.existsSync(outFile)) {
         try {
           const prev = JSON.parse(fs.readFileSync(outFile, 'utf8'));
-          const prevPaths = new Set((prev.endpoints || []).map(e => `${e.method} ${e.pathPattern}`));
-          const newPaths = new Set((schema.endpoints || []).map(e => `${e.method} ${e.pathPattern}`));
+          const prevPaths = new Set((prev.endpoints || []).map(e => `${e.method} ${e.path || e.pathPattern}`));
+          const newPaths = new Set((schema.endpoints || []).map(e => `${e.method} ${e.path || e.pathPattern}`));
           const added = [...newPaths].filter(p => !prevPaths.has(p));
           const removed = [...prevPaths].filter(p => !newPaths.has(p));
           if (added.length || removed.length) {

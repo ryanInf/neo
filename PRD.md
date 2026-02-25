@@ -28,7 +28,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - 对比 browser-use：在 API 层操作，快一个数量级，不受 UI 改版影响。
 - 一句话：**装个插件，用几天，AI 就学会了你用的所有工具。**
 
-## 当前状态 (v0.4.0)
+## 当前状态 (v0.5.0)
 
 ### ✅ 已完成
 
@@ -57,11 +57,15 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 
 **CLI (统一 `neo.cjs`)**
 - `neo status` — 扩展连接状态
-- `neo capture list/count/detail/clear/watch/stats/search/export/import` — 完整捕获管理
-- `neo schema generate/list/show` — Schema 生成和查看
+- `neo capture list/count/detail/clear/watch/stats/summary/search/export/import/prune/gc` — 完整捕获管理
+- `neo schema generate/list/show` — Schema 生成和查看（支持版本 diff 和 history 归档）
 - `neo exec` — API 执行
 - `neo replay` — 捕获重放
 - `neo eval` — JS 执行
+- `neo tabs` — 列出 Chrome 标签页
+- `neo doctor` — 一键诊断 Chrome/CDP/扩展/IndexedDB/Schema/Bridge 状态
+- `neo reload` — CLI 重载扩展
+- `neo version` — 版本信息
 - 友好的错误消息 — Chrome 未启动、扩展未安装等场景
 
 **Popup UI**
@@ -81,7 +85,13 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - NDJSON output mode for piping into other tools
 
 **已生成 Schema**
-- GitHub (17 endpoints), YouTube (14), Reddit (18), X/Twitter (GraphQL), Linear (1), Notion (2)
+- GitHub (17 endpoints), YouTube (14), Reddit (18), X/Twitter (GraphQL), Linear (1), Notion (2), Bilibili (28)
+
+**代码质量**
+- TypeScript strict mode，零 tsc errors
+- 纯函数提取到 `interceptor-utils.ts`，47 个单元测试
+- GitHub Actions CI (typecheck + test + build)
+- interceptor.ts 673 行，neo.cjs 1544 行
 
 ### 🔲 待做
 
@@ -121,9 +131,10 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 │     │   (inherits cookies/auth)              │
 │     └─ Execute arbitrary JS (eval)           │
 │                                              │
-│  ③ Bridge (planned)                          │
-│     ├─ WebSocket push to AI                  │
-│     └─ Receive commands from AI              │
+│  ③ Bridge (WebSocket)                        │
+│     ├─ Auto-connect to ws://127.0.0.1:9234   │
+│     ├─ Real-time capture streaming            │
+│     └─ Bidirectional command channel          │
 └──────────────────┬──────────────────────────┘
                    │ CDP (Chrome DevTools Protocol)
 ┌──────────────────┴──────────────────────────┐
