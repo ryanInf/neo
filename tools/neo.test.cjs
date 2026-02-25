@@ -201,6 +201,96 @@ test('uses tag + class', () => assert.strictEqual(getSelector({ tagName: 'DIV', 
 test('uses tag only', () => assert.strictEqual(getSelector({ tagName: 'SPAN' }), 'span'));
 test('limits to 2 classes', () => assert.strictEqual(getSelector({ tagName: 'DIV', className: 'a b c d' }), 'div.a.b'));
 
-// ─── Summary ────────────────────────────────────────────────────
+// ─── HAR conversion helpers ─────────────────────────────────────
+
+console.log('\nHAR export helpers:');
+
+function captureToHarEntry(cap) {
+  const reqHeaders = Object.entries(cap.requestHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+  const respHeaders = Object.entries(cap.responseHeaders || {}).map(([n, v]) => ({ name: n, value: String(v) }));
+  let queryString = [];
+  try {
+    const u = new URL(cap.url);
+    queryString = [...u.searchParams].map(([n, v]) => ({ name: n, value: v }));
+  } catch {}
+  return {
+    startedDateTime: new Date(cap.timestamp).toISOString(),
+    time: cap.duration || 0,
+    request: { method: cap.method, url: cap.url, headers: reqHeaders, queryString },
+    response: { status: cap.responseStatus || 0, headers: respHeaders },
+  };
+}
+
+test('converts capture to HAR entry', () => {
+  const entry = captureToHarEntry({
+    url: 'https://api.example.com/data?page=1',
+    method: 'GET',
+    timestamp: 1700000000000,
+    duration: 250,
+    responseStatus: 200,
+    requestHeaders: { 'Accept': 'application/json' },
+    responseHeaders: { 'content-type': 'application/json' },
+  });
+  assert.strictEqual(entry.request.method, 'GET');
+  assert.strictEqual(entry.response.status, 200);
+  assert.strictEqual(entry.time, 250);
+  assert.strictEqual(entry.request.queryString.length, 1);
+  assert.strictEqual(entry.request.queryString[0].name, 'page');
+});
+
+test('handles missing headers gracefully', () => {
+  const entry = captureToHarEntry({ url: 'https://x.com/api', method: 'POST', timestamp: 0 });
+  assert.strictEqual(entry.request.headers.length, 0);
+  assert.strictEqual(entry.response.status, 0);
+});
+
+// ─── OpenAPI conversion helpers ─────────────────────────────────
+
+console.log('\nOpenAPI helpers:');
+
+function neoToJsonSchema(struct) {
+  if (!struct || typeof struct !== 'object') return { type: 'object' };
+  if (Array.isArray(struct)) {
+    return { type: 'array', items: struct.length ? neoToJsonSchema(struct[0]) : {} };
+  }
+  const properties = {};
+  for (const [k, v] of Object.entries(struct)) {
+    if (typeof v === 'string') {
+      properties[k] = v === 'null' ? {} : { type: v };
+    } else if (typeof v === 'object') {
+      properties[k] = neoToJsonSchema(v);
+    }
+  }
+  return { type: 'object', properties };
+}
+
+test('converts flat structure', () => {
+  const schema = neoToJsonSchema({ id: 'number', name: 'string' });
+  assert.strictEqual(schema.type, 'object');
+  assert.strictEqual(schema.properties.id.type, 'number');
+  assert.strictEqual(schema.properties.name.type, 'string');
+});
+
+test('converts nested structure', () => {
+  const schema = neoToJsonSchema({ user: { id: 'number', name: 'string' } });
+  assert.strictEqual(schema.properties.user.type, 'object');
+  assert.strictEqual(schema.properties.user.properties.id.type, 'number');
+});
+
+test('converts array structure', () => {
+  const schema = neoToJsonSchema([{ id: 'number' }]);
+  assert.strictEqual(schema.type, 'array');
+  assert.strictEqual(schema.items.properties.id.type, 'number');
+});
+
+test('handles null type', () => {
+  const schema = neoToJsonSchema({ field: 'null' });
+  assert.deepStrictEqual(schema.properties.field, {});
+});
+
+test('handles empty/null input', () => {
+  assert.strictEqual(neoToJsonSchema(null).type, 'object');
+  assert.strictEqual(neoToJsonSchema(undefined).type, 'object');
+});
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail > 0 ? 1 : 0);
