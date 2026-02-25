@@ -83,6 +83,8 @@ node tools/neo.cjs schema generate --all         # Batch generate for all domain
 node tools/neo.cjs schema show x.com             # Human-readable summary
 node tools/neo.cjs schema show x.com --json      # Raw JSON
 node tools/neo.cjs schema openapi x.com          # Export as OpenAPI 3.0 spec
+node tools/neo.cjs schema diff x.com             # Show changes from previous version
+node tools/neo.cjs schema coverage               # Which domains have schemas vs just captures
 
 # Execute API calls (auth headers auto-detected from captures)
 node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
@@ -95,6 +97,11 @@ node tools/neo.cjs api github.com notifications
 # Analyze API patterns
 node tools/neo.cjs flows x.com                      # Discover call sequence patterns
 node tools/neo.cjs flows x.com --window 5000        # Custom time window
+node tools/neo.cjs suggest x.com                    # AI capability analysis for domain
+
+# Mock server
+node tools/neo.cjs mock x.com                       # Start mock server from schema
+node tools/neo.cjs mock x.com --port 8080 --latency 200
 
 # Page interaction
 node tools/neo.cjs read github.com
