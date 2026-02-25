@@ -94,6 +94,18 @@ function dbEval(body) {
   })`;
 }
 
+const AUTH_HEADER_PATTERNS = [
+  'authorization', 'x-csrf-token', 'x-twitter-auth-type', 'x-twitter-active-user',
+  'x-twitter-client-language', 'x-client-transaction-id', 'x-requested-with',
+  'github-verified-fetch', 'x-fetch-nonce', 'x-github-client-version',
+  'x-api-key', 'api-key',
+];
+
+function isAuthHeader(name) {
+  const lk = name.toLowerCase();
+  return AUTH_HEADER_PATTERNS.includes(lk) || lk.startsWith('x-csrf') || lk.startsWith('x-api') || lk.startsWith('x-twitter');
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 /** Parse duration strings like "1h", "30m", "2d" into milliseconds */
@@ -744,11 +756,8 @@ commands.exec = async function(args) {
         };
       `));
       const autoHeaders = JSON.parse(raw);
-      const authKeys = ['authorization', 'x-csrf-token', 'x-twitter-auth-type', 'x-twitter-active-user',
-        'x-twitter-client-language', 'x-client-transaction-id', 'x-requested-with',
-        'github-verified-fetch', 'x-fetch-nonce'];
       for (const [k, v] of Object.entries(autoHeaders)) {
-        if (authKeys.includes(k.toLowerCase()) || k.toLowerCase().startsWith('x-csrf') || k.toLowerCase().startsWith('x-twitter')) {
+        if (isAuthHeader(k)) {
           if (!headers[k]) headers[k] = v;
         }
       }
