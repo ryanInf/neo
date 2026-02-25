@@ -1,4 +1,4 @@
-# Neo v2 — 把任意 Web App 变成 AI 可调用的工具
+# Neo — 把任意 Web App 变成 AI 可调用的工具
 
 ## 一句话
 

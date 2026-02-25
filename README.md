@@ -142,12 +142,12 @@ The interceptor ignores noise automatically:
 
 ## Roadmap
 
-- [x] v0.1 — Extension: capture + store + popup viewer
-- [x] v0.2 — CLI tools: query, schema, execute, unified interface
-- [x] v0.2.1 — Storage management: per-domain caps, auto-cleanup
-- [ ] v0.3 — Incremental schema updates, export/import
-- [ ] v0.4 — Dual-channel: Neo API-first → browser-use fallback
-- [ ] v0.5 — Multi-step workflow replay
+- [x] Extension: capture + store + popup viewer
+- [x] CLI tools: query, schema, execute, unified interface
+- [x] Storage management: per-domain caps, auto-cleanup
+- [ ] Incremental schema updates, export/import
+- [ ] Dual-channel: Neo API-first → browser-use fallback
+- [ ] Multi-step workflow replay
 
 ## License
 
