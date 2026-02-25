@@ -291,6 +291,19 @@ commands.schema = async function(args) {
           var store = tx.objectStore("${STORE_NAME}");
           var idx = store.index("domain");
           var endpoints = {};
+          
+          // Normalize paths: collapse variable segments (hashes, IDs, UUIDs)
+          function normalizePath(p) {
+            return p.split('/').map(function(seg) {
+              // GraphQL query hashes (e.g., oB-5XsHNAbjvARJEc8CZFw)
+              if (/^[a-zA-Z0-9_-]{15,30}$/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg)) return ':hash';
+              // UUIDs
+              if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return ':uuid';
+              // Numeric IDs (pure digits, 4+ chars)
+              if (/^\\d{4,}$/.test(seg)) return ':id';
+              return seg;
+            }).join('/');
+          }
           var total = 0;
           var authKeys = ['authorization', 'x-csrf-token', 'x-twitter-auth-type',
             'x-requested-with', 'x-github-client-version'];
@@ -302,10 +315,10 @@ commands.schema = async function(args) {
               total++;
               try {
                 var u = new URL(v.url);
-                var key = v.method + " " + u.pathname;
+                var key = v.method + " " + normalizePath(u.pathname);
                 if (!endpoints[key]) {
                   endpoints[key] = {
-                    method: v.method, path: u.pathname,
+                    method: v.method, path: normalizePath(u.pathname),
                     queryParams: {}, statusCodes: {},
                     headers: {}, durations: [], count: 0, responseType: null
                   };
