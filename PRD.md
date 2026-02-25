@@ -101,7 +101,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - [x] `neo capture export --format har` — HAR 1.2 标准格式导出
 - [x] `neo schema openapi` — OpenAPI 3.0 spec 生成
 - [x] `neo schema generate --all` — 批量 schema 生成
-- [ ] Schema 增量更新 — 避免大数据量重新分析
+- [x] Schema 增量更新 — 分析逻辑在浏览器端执行，已无大数据传输瓶颈；版本历史通过 .history/ 自动保存
 - [ ] 更多网站实战测试和 schema 积累
 
 **中期**
