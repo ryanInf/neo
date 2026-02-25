@@ -10,11 +10,13 @@
 //   neo capture stats <domain>              Domain statistics
 //   neo capture clear [domain]              Clear captures
 //   neo capture export [domain]             Export captures as JSON
+//   neo capture import <file>               Import captures from JSON file
 //   neo schema generate <domain>            Generate API schema from captures
 //   neo schema show <domain>                Show cached schema
 //   neo exec <url> [options]                Execute fetch in browser tab context
 //   neo eval <js> --tab <pattern>           Evaluate JS in page context
 //   neo open <url>                          Open URL in Chrome
+//   neo replay <id> [--tab pattern]          Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
 
 const WebSocket = require('ws');
@@ -296,6 +298,44 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'import': {
+      const file = positional[1];
+      if (!file) { console.error('Usage: neo capture import <file.json>'); process.exit(1); }
+      if (!fs.existsSync(file)) { console.error(`File not found: ${file}`); process.exit(1); }
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const items = Array.isArray(data) ? data : [data];
+      if (!items.length) { console.log('No captures in file'); break; }
+      const wsUrl = await findExtensionWs();
+      // Import in batches of 50 via the extension's IndexedDB
+      const batchSize = 50;
+      let imported = 0;
+      for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const result = await cdpEval(wsUrl, `new Promise(function(resolve) {
+          var req = indexedDB.open("${DB_NAME}");
+          req.onsuccess = function() {
+            var db = req.result;
+            var tx = db.transaction("${STORE_NAME}", "readwrite");
+            var store = tx.objectStore("${STORE_NAME}");
+            var items = ${JSON.stringify(batch)};
+            var count = 0;
+            items.forEach(function(item) {
+              store.put(item).onsuccess = function() { count++; };
+            });
+            tx.oncomplete = function() { resolve(String(count)); };
+            tx.onerror = function() { resolve("Error: " + tx.error); };
+          };
+          req.onerror = function() { resolve("Error: " + req.error); };
+          setTimeout(function() { resolve("timeout"); }, 30000);
+        })`, 35000);
+        const n = parseInt(result);
+        if (!isNaN(n)) imported += n;
+        else { console.error(`Batch error: ${result}`); }
+      }
+      console.log(`Imported ${imported} captures from ${file}`);
+      break;
+    }
+
     case 'watch': {
       const domain = positional[1];
       console.error(`Watching captures${domain ? ' for ' + domain : ''}... (Ctrl+C to stop)`);
@@ -344,6 +384,7 @@ commands.capture = async function(args) {
   neo capture detail <id>                 Show full capture details
   neo capture clear [domain]              Clear captures (all or by domain)
   neo capture export [domain]             Export captures as JSON
+  neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures`);
   }
 };
@@ -674,6 +715,69 @@ commands.open = async function(args) {
   console.log(`Opened: ${tab.url}`);
 };
 
+// neo replay <id> [--tab pattern]
+commands.replay = async function(args) {
+  const { positional, flags } = parseArgs(args);
+  const id = positional[0];
+  if (!id) { console.error('Usage: neo replay <capture-id> [--tab pattern]'); process.exit(1); }
+
+  // Fetch the capture details
+  const wsUrl = await findExtensionWs();
+  const raw = await cdpEval(wsUrl, dbEval(`
+    store.get(${JSON.stringify(id)}).onsuccess = function(e) {
+      var v = e.target.result;
+      if (!v) { resolve("null"); return; }
+      resolve(JSON.stringify(v));
+    };
+  `));
+  if (raw === 'null' || !raw) { console.error(`Capture not found: ${id}`); process.exit(1); }
+  const capture = JSON.parse(raw);
+
+  if (capture.method.startsWith('WS_')) {
+    console.error('Cannot replay WebSocket captures. Use neo exec for HTTP calls.');
+    process.exit(1);
+  }
+
+  const tabPattern = flags.tab || capture.domain;
+  const tab = await findTab(tabPattern);
+  console.error(`Replaying: ${capture.method} ${capture.url.slice(0, 80)}...`);
+  console.error(`Target tab: ${tab.url.slice(0, 60)}...`);
+
+  const headers = capture.requestHeaders || {};
+  // Remove headers that fetch shouldn't set
+  delete headers['host'];
+  delete headers['Host'];
+  delete headers['content-length'];
+  delete headers['Content-Length'];
+
+  const fetchOpts = { method: capture.method, headers, credentials: 'include' };
+  if (capture.requestBody && capture.method !== 'GET') {
+    fetchOpts.body = typeof capture.requestBody === 'string'
+      ? capture.requestBody : JSON.stringify(capture.requestBody);
+  }
+
+  const result = await cdpEval(tab.webSocketDebuggerUrl, `
+    (async function() {
+      try {
+        var resp = await fetch(${JSON.stringify(capture.url)}, ${JSON.stringify(fetchOpts)});
+        var text = await resp.text();
+        return JSON.stringify({
+          status: resp.status, statusText: resp.statusText,
+          headers: Object.fromEntries(resp.headers.entries()),
+          body: text.length > 50000 ? text.slice(0, 50000) + '...[truncated]' : text
+        });
+      } catch (err) { return JSON.stringify({ error: err.message }); }
+    })()
+  `);
+
+  const parsed = JSON.parse(result);
+  if (parsed.error) { console.error('Error:', parsed.error); process.exit(1); }
+  console.log(`HTTP ${parsed.status} ${parsed.statusText}`);
+  console.log('---');
+  try { console.log(JSON.stringify(JSON.parse(parsed.body), null, 2)); }
+  catch { console.log(parsed.body); }
+};
+
 // neo read <tab-pattern>
 commands.read = async function(args) {
   const pattern = args[0];
@@ -713,10 +817,11 @@ async function main() {
 
 Commands:
   neo status                              Overview of captured data
-  neo capture list|count|domains|detail|clear|export
+  neo capture list|count|domains|detail|clear|export|import
                                           Manage captured API traffic
   neo schema generate|show <domain>       API schema management
   neo exec <url> [options]                Execute fetch in browser context
+  neo replay <id> [--tab pattern]         Replay a captured API call
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page

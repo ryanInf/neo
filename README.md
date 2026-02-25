@@ -63,6 +63,10 @@ node tools/neo.cjs capture list github.com --limit 10
 node tools/neo.cjs capture domains
 node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
 node tools/neo.cjs capture export x.com > x-captures.json
+node tools/neo.cjs capture import x-captures.json     # Import captures from file
+
+# Replay a captured API call
+node tools/neo.cjs replay <capture-id> --tab x.com
 
 # API schema (auto-saves to local knowledge base)
 node tools/neo.cjs schema list                   # List all known schemas
@@ -158,6 +162,9 @@ The interceptor ignores noise automatically:
 - [x] Storage management: per-domain caps, auto-cleanup, rate limiting
 - [x] Schema: browser-side analysis, URL normalization, body structure extraction
 - [x] Smart filtering: static assets, analytics, duplicate suppression
+- [x] WebSocket capture (open/close/send/recv with throttling)
+- [x] Capture replay: `neo replay <id>` re-executes captured calls
+- [x] Import/export: cross-device capture migration
 - [ ] Dual-channel: Neo API-first → browser-use fallback
 - [ ] Multi-step workflow replay
 
