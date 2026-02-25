@@ -298,6 +298,33 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'search': {
+      const query = positional.slice(1).join(' ');
+      if (!query) { console.error('Usage: neo capture search <query> [--method GET] [--status 200] [--limit N]'); process.exit(1); }
+      const limit = parseInt(flags.limit) || 20;
+      const methodFilter = flags.method ? flags.method.toUpperCase() : null;
+      const statusFilter = flags.status ? parseInt(flags.status) : null;
+      const r = await cdpEval(wsUrl, dbEval(`
+        var rows = [], query = ${JSON.stringify(query)}, limit = ${limit};
+        var methodFilter = ${methodFilter ? JSON.stringify(methodFilter) : 'null'};
+        var statusFilter = ${statusFilter || 'null'};
+        store.openCursor(null, "prev").onsuccess = function(e) {
+          var c = e.target.result;
+          if (c && rows.length < limit) {
+            var v = c.value;
+            if (v.url.indexOf(query) >= 0 || (v.domain && v.domain.indexOf(query) >= 0)) {
+              if (methodFilter && v.method !== methodFilter) { c.continue(); return; }
+              if (statusFilter && v.responseStatus !== statusFilter) { c.continue(); return; }
+              rows.push(v.id + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)");
+            }
+            c.continue();
+          } else { resolve(rows.join("\\n")); }
+        };
+      `));
+      console.log(r || '(no matches)');
+      break;
+    }
+
     case 'import': {
       const file = positional[1];
       if (!file) { console.error('Usage: neo capture import <file.json>'); process.exit(1); }
@@ -382,6 +409,7 @@ commands.capture = async function(args) {
   neo capture domains                     List domains with counts
   neo capture stats <domain>              Domain statistics (methods, errors, timing)
   neo capture detail <id>                 Show full capture details
+  neo capture search <query>              Search captures by URL (--method, --status, --limit)
   neo capture clear [domain]              Clear captures (all or by domain)
   neo capture export [domain]             Export captures as JSON
   neo capture import <file>               Import captures from JSON file
@@ -817,7 +845,7 @@ async function main() {
 
 Commands:
   neo status                              Overview of captured data
-  neo capture list|count|domains|detail|clear|export|import
+  neo capture list|count|domains|detail|search|clear|export|import
                                           Manage captured API traffic
   neo schema generate|show <domain>       API schema management
   neo exec <url> [options]                Execute fetch in browser context
