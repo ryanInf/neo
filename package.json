@@ -4,7 +4,8 @@
   "version": "0.4.0",
   "type": "module",
   "scripts": {
-    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build && NEO_ENTRY=popup vite build"
+    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build && NEO_ENTRY=popup vite build",
+    "test": "node tools/neo.test.cjs"
   },
   "dependencies": {
     "dexie": "^4.0.11",
