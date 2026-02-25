@@ -257,7 +257,7 @@ commands.capture = async function(args) {
           setTimeout(function() { resolve("timeout"); }, 10000);
         })`);
         console.log(r);
-      } else {
+      } else if (flags.all) {
         const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
           var req = indexedDB.open("${DB_NAME}");
           req.onsuccess = function() {
@@ -268,6 +268,8 @@ commands.capture = async function(args) {
           setTimeout(function() { resolve("timeout"); }, 5000);
         })`);
         console.log(r);
+      } else {
+        console.error('Usage: neo capture clear <domain>  or  neo capture clear --all');
       }
       break;
     }
