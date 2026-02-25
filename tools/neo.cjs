@@ -1191,6 +1191,88 @@ commands.schema = async function(args) {
       break;
     }
 
+    case 'diff': {
+      const domain = positional[1];
+      if (!domain) { console.error('Usage: neo schema diff <domain>'); process.exit(1); }
+      
+      const currentFile = path.join(SCHEMA_DIR, `${domain}.json`);
+      if (!fs.existsSync(currentFile)) {
+        console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
+        process.exit(1);
+      }
+      
+      const histDir = path.join(SCHEMA_DIR, '.history');
+      if (!fs.existsSync(histDir)) {
+        console.log('No history available (first schema version)');
+        break;
+      }
+      
+      const prefix = domain + '.';
+      const histFiles = fs.readdirSync(histDir)
+        .filter(f => f.startsWith(prefix) && f.endsWith('.json'))
+        .sort()
+        .reverse();
+      
+      if (histFiles.length === 0) {
+        console.log('No previous versions found');
+        break;
+      }
+      
+      const current = JSON.parse(fs.readFileSync(currentFile, 'utf8'));
+      const previous = JSON.parse(fs.readFileSync(path.join(histDir, histFiles[0]), 'utf8'));
+      
+      const currentEndpoints = new Set((current.endpoints || []).map(e => `${e.method} ${e.path}`));
+      const previousEndpoints = new Set((previous.endpoints || []).map(e => `${e.method} ${e.path}`));
+      
+      const added = [...currentEndpoints].filter(e => !previousEndpoints.has(e));
+      const removed = [...previousEndpoints].filter(e => !currentEndpoints.has(e));
+      const shared = [...currentEndpoints].filter(e => previousEndpoints.has(e));
+      
+      const currentMap = new Map((current.endpoints || []).map(e => [`${e.method} ${e.path}`, e]));
+      const previousMap = new Map((previous.endpoints || []).map(e => [`${e.method} ${e.path}`, e]));
+      
+      const changed = [];
+      for (const key of shared) {
+        const c = currentMap.get(key);
+        const p = previousMap.get(key);
+        const diffs = [];
+        if (c.callCount !== p.callCount) diffs.push(`calls: ${p.callCount} → ${c.callCount}`);
+        const cStatuses = Object.keys(c.statusCodes || {}).sort().join(',');
+        const pStatuses = Object.keys(p.statusCodes || {}).sort().join(',');
+        if (cStatuses !== pStatuses) diffs.push(`status codes: ${pStatuses} → ${cStatuses}`);
+        if (diffs.length) changed.push({ key, diffs });
+      }
+      
+      const prevTs = histFiles[0].replace(prefix, '').replace('.json', '');
+      const prevDate = prevTs.replace(/T/, ' ').replace(/-(\d{2})-(\d{2})-(\d{3})/, ':$1:$2.$3').slice(0, 19);
+      console.log(`Schema diff for ${domain}`);
+      console.log(`  Previous: ${prevDate} (${previousEndpoints.size} endpoints)`);
+      console.log(`  Current:  ${current.generatedAt?.slice(0, 19).replace('T', ' ')} (${currentEndpoints.size} endpoints)`);
+      console.log(`  History versions: ${histFiles.length}\n`);
+      
+      if (added.length === 0 && removed.length === 0 && changed.length === 0) {
+        console.log('  No changes detected');
+        break;
+      }
+      
+      if (added.length > 0) {
+        console.log(`  + ${added.length} new endpoint(s):`);
+        for (const e of added) console.log(`    + ${e}`);
+        console.log();
+      }
+      if (removed.length > 0) {
+        console.log(`  - ${removed.length} removed endpoint(s):`);
+        for (const e of removed) console.log(`    - ${e}`);
+        console.log();
+      }
+      if (changed.length > 0) {
+        console.log(`  ~ ${changed.length} changed endpoint(s):`);
+        for (const c of changed) console.log(`    ~ ${c.key}  (${c.diffs.join(', ')})`);
+        console.log();
+      }
+      break;
+    }
+
     default:
       console.log(`neo schema — API schema management
 
@@ -1199,7 +1281,8 @@ commands.schema = async function(args) {
   neo schema show <domain>        Show cached schema (--json for raw)
   neo schema search <query>       Search all schemas for matching endpoints
   neo schema coverage             Show which domains have schemas vs just captures
-  neo schema openapi <domain>     Export as OpenAPI 3.0 spec`);
+  neo schema openapi <domain>     Export as OpenAPI 3.0 spec
+  neo schema diff <domain>        Show changes from previous schema version`);
   }
 };
 
