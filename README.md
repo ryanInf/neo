@@ -80,6 +80,15 @@ node tools/neo.cjs schema show x.com --json      # Raw JSON
 # Execute API calls (auth headers auto-detected from captures)
 node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
 
+# Smart API call (schema lookup + auto-auth + auto-tab)
+node tools/neo.cjs api x.com badge_count           # Zero-config authenticated call
+node tools/neo.cjs api x.com HomeTimeline           # Finds URL, auth, tab automatically
+node tools/neo.cjs api github.com notifications
+
+# Analyze API patterns
+node tools/neo.cjs flows x.com                      # Discover call sequence patterns
+node tools/neo.cjs flows x.com --window 5000        # Custom time window
+
 # Page interaction
 node tools/neo.cjs read github.com
 node tools/neo.cjs eval "document.title" --tab github.com
@@ -126,6 +135,8 @@ The bridge creates a persistent WebSocket channel between the extension and CLI.
 │  ├─ neo capture → read/export/search  │
 │  ├─ neo schema  → analyze → schema   │
 │  ├─ neo exec    → execute in browser │
+│  ├─ neo api     → smart schema call  │
+│  ├─ neo flows   → sequence analysis  │
 │  ├─ neo replay  → re-run captured    │
 │  ├─ neo eval    → run JS in tab      │
 │  └─ neo read    → extract page text  │
@@ -211,6 +222,8 @@ The interceptor ignores noise automatically:
 - [x] WebSocket capture (open/close/send/recv with throttling)
 - [x] Capture replay: `neo replay <id>` re-executes captured calls
 - [x] Import/export: cross-device capture migration
+- [x] Smart API call: `neo api` with schema lookup + auto-auth
+- [x] Flow analysis: `neo flows` discovers API call sequences
 - [ ] Dual-channel: Neo API-first → browser-use fallback
 - [ ] Multi-step workflow replay
 
