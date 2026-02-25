@@ -23,6 +23,13 @@ const ANALYTICS_KEYWORDS = [
   'static.cloudflareinsights.com', 'rum.browser-intake-datadoghq.com',
   'app.launchdarkly.com', 'events.launchdarkly.com',
   'api.statsig.com', 'featuregates.org',
+  // Bilibili CDNs/trackers (not API calls — api.bilibili.com IS useful)
+  'hdslb.com', 'bilivideo.com', 'bilivideo.cn', 'biliapi.net',
+  'data.bilibili.com', 'cm.bilibili.com',
+  // Anthropic CDN/stats
+  'a-cdn.anthropic.com', 'a-cdn.claude.ai', 'statsig.anthropic.com',
+  // Honeycomb
+  'api.honeycomb.io',
 ];
 
 // Dedup: track recent URL patterns to suppress high-frequency duplicates
