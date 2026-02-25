@@ -20,7 +20,7 @@ const windowState = window as WindowWithNeo;
 
 if (!windowState.__neoContentScriptInstalled) {
   windowState.__neoContentScriptInstalled = true;
-  injectInterceptorScript();
+  // inject.js now runs via world: "MAIN" content script — no manual injection needed
   attachDomListeners();
   window.addEventListener('message', onPageCaptureMessage, false);
 }

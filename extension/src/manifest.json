@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Neo",
-  "version": "0.1.0",
-  "description": "Neo v0.1 MVP: capture fetch/XMLHttpRequest traffic and inspect in popup.",
+  "version": "0.2.0",
+  "description": "Neo: capture fetch/XHR/WebSocket traffic, generate API schemas, execute from CLI.",
   "permissions": [
     "tabs"
   ],
@@ -17,6 +17,17 @@
     "default_popup": "popup.html"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
     {
       "matches": [
         "<all_urls>"
