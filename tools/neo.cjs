@@ -389,7 +389,7 @@ commands.capture = async function(args) {
           const har = {
             log: {
               version: '1.2',
-              creator: { name: 'Neo', version: '0.5.0' },
+              creator: { name: 'Neo', version: '0.6.0' },
               entries,
             }
           };
