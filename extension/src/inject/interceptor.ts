@@ -671,10 +671,12 @@ if (!window.__neoInterceptorInstalled) {
 
   // Preserve static properties
   window.WebSocket.prototype = OriginalWebSocket.prototype;
-  window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
-  window.WebSocket.OPEN = OriginalWebSocket.OPEN;
-  window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
-  window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+  Object.defineProperties(window.WebSocket, {
+    CONNECTING: { value: OriginalWebSocket.CONNECTING },
+    OPEN: { value: OriginalWebSocket.OPEN },
+    CLOSING: { value: OriginalWebSocket.CLOSING },
+    CLOSED: { value: OriginalWebSocket.CLOSED },
+  });
 
   // ── EventSource (SSE) interception ───────────────────────────────
   const OriginalEventSource = window.EventSource;
@@ -762,8 +764,10 @@ if (!window.__neoInterceptorInstalled) {
     } as unknown as typeof EventSource;
 
     window.EventSource.prototype = OriginalEventSource.prototype;
-    window.EventSource.CONNECTING = OriginalEventSource.CONNECTING;
-    window.EventSource.OPEN = OriginalEventSource.OPEN;
-    window.EventSource.CLOSED = OriginalEventSource.CLOSED;
+    Object.defineProperties(window.EventSource, {
+      CONNECTING: { value: OriginalEventSource.CONNECTING },
+      OPEN: { value: OriginalEventSource.OPEN },
+      CLOSED: { value: OriginalEventSource.CLOSED },
+    });
   }
 }
