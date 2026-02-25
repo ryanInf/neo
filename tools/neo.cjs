@@ -469,7 +469,20 @@ commands.schema = async function(args) {
         console.error(`No schema for ${domain}. Run: neo schema generate ${domain}`);
         process.exit(1);
       }
-      console.log(fs.readFileSync(file, 'utf8'));
+      const schema = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (flags.json) {
+        console.log(JSON.stringify(schema, null, 2));
+      } else {
+        // Human-readable summary
+        console.log(`${schema.domain} — ${schema.uniqueEndpoints} endpoints from ${schema.totalCaptures} captures`);
+        console.log(`Generated: ${schema.generatedAt}\n`);
+        for (const ep of schema.endpoints) {
+          const auth = ep.authHeaders?.length ? ` [auth: ${ep.authHeaders.join(', ')}]` : '';
+          const params = ep.queryParams?.length ? ` ?${ep.queryParams.join('&')}` : '';
+          const body = ep.requestBodyStructure ? ` body:{${Object.keys(ep.requestBodyStructure).join(', ')}}` : '';
+          console.log(`  ${ep.method} ${ep.path}${params}  (${ep.callCount}x, ${ep.avgDuration || '?'})${auth}${body}`);
+        }
+      }
       break;
     }
 
