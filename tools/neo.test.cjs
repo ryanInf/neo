@@ -365,5 +365,82 @@ test('buildMockBody handles null/undefined input', () => {
   assert.deepStrictEqual(buildMockBody(undefined), { ok: true });
 });
 
+// ─── URL normalization (used in flows/deps) ─────────────────────
+
+function normEndpoint(url, method) {
+  try {
+    const u = new URL(url);
+    let p = u.pathname;
+    p = p.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':uuid');
+    p = p.replace(/\/\d{4,}\b/g, '/:id');
+    p = p.replace(/\/[0-9a-f]{24,}/gi, '/:hash');
+    return `${method} ${p}`;
+  } catch { return `${method} ${url}`; }
+}
+
+console.log('\nnormEndpoint:');
+test('parameterizes UUIDs', () => {
+  assert.strictEqual(
+    normEndpoint('https://api.example.com/users/550e8400-e29b-41d4-a716-446655440000/posts', 'GET'),
+    'GET /users/:uuid/posts'
+  );
+});
+test('parameterizes numeric IDs (4+ digits)', () => {
+  assert.strictEqual(
+    normEndpoint('https://api.example.com/posts/12345', 'GET'),
+    'GET /posts/:id'
+  );
+});
+test('leaves short numbers alone', () => {
+  assert.strictEqual(
+    normEndpoint('https://api.example.com/v2/posts', 'GET'),
+    'GET /v2/posts'
+  );
+});
+test('parameterizes hex hashes (24+ chars)', () => {
+  assert.strictEqual(
+    normEndpoint('https://api.example.com/objects/507f1f77bcf86cd799439011', 'GET'),
+    'GET /objects/:hash'
+  );
+});
+test('handles multiple parameterizations', () => {
+  assert.strictEqual(
+    normEndpoint('https://api.example.com/users/12345/posts/67890', 'POST'),
+    'POST /users/:id/posts/:id'
+  );
+});
+test('handles malformed URL gracefully', () => {
+  assert.strictEqual(normEndpoint('not-a-url', 'GET'), 'GET not-a-url');
+});
+
+// ─── Edge cases ─────────────────────────────────────────────────
+
+console.log('\nedge cases:');
+test('shouldSkipUrl handles relative path', () => {
+  // Relative URLs resolve against baseHref, so they're valid
+  assert(!shouldSkipUrl('/api/data', {}, 'http://example.com'));
+});
+test('parseDuration handles zero', () => {
+  assert.strictEqual(parseDuration('0s'), 0);
+});
+test('parseArgs handles empty array', () => {
+  const r = parseArgs([]);
+  assert.deepStrictEqual(r.positional, []);
+  assert.deepStrictEqual(r.flags, {});
+});
+test('getCaptureKey normalizes method+url', () => {
+  const k1 = getCaptureKey('GET', '/api/test', 'http://example.com');
+  const k2 = getCaptureKey('POST', '/api/test', 'http://example.com');
+  assert.notStrictEqual(k1, k2);
+});
+test('getSelector returns tag for plain elements', () => {
+  const el = { tagName: 'BUTTON', id: '', className: '' };
+  assert.strictEqual(getSelector(el), 'button');
+});
+test('getSelector returns #id when present', () => {
+  const el = { tagName: 'DIV', id: 'main', className: '' };
+  assert.strictEqual(getSelector(el), '#main');
+});
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail > 0 ? 1 : 0);
