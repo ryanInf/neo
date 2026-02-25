@@ -192,7 +192,7 @@ commands.capture = async function(args) {
             if (since && v.timestamp < since) { resolve(rows.join("\\n")); return; }
             if (!domain || v.domain === domain) {
               var src = v.source === 'websocket' ? ' [ws]' : v.source === 'eventsource' ? ' [sse]' : '';
-              rows.push(v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)" + src);
+              rows.push(v.id.slice(0,8) + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 90) + " (" + v.duration + "ms)" + src);
             }
             c.continue();
           } else { resolve(rows.join("\\n")); }
@@ -417,6 +417,39 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'summary': {
+      // Quick overview optimized for AI agents
+      const r = await cdpEval(wsUrl, dbEval(`
+        var domains = {}, sources = {}, total = 0, oldest = Infinity, newest = 0;
+        store.openCursor().onsuccess = function(e) {
+          var c = e.target.result;
+          if (c) {
+            var v = c.value;
+            total++;
+            domains[v.domain] = (domains[v.domain] || 0) + 1;
+            sources[v.source || 'fetch'] = (sources[v.source || 'fetch'] || 0) + 1;
+            if (v.timestamp < oldest) oldest = v.timestamp;
+            if (v.timestamp > newest) newest = v.timestamp;
+            c.continue();
+          } else {
+            resolve(JSON.stringify({ total: total, domains: domains, sources: sources, oldest: oldest, newest: newest }));
+          }
+        };
+      `));
+      const s = JSON.parse(r);
+      if (!s.total) { console.log('No captures.'); break; }
+      const span = Math.round((s.newest - s.oldest) / 3600000);
+      console.log(`${s.total} captures across ${Object.keys(s.domains).length} domains (${span}h span)\n`);
+      console.log('Sources:', Object.entries(s.sources).map(([k,v])=>`${k}: ${v}`).join(', '));
+      console.log('\nDomains:');
+      const sorted = Object.entries(s.domains).sort((a,b)=>b[1]-a[1]);
+      for (const [d, c] of sorted.slice(0, 15)) {
+        console.log(`  ${d}: ${c}`);
+      }
+      if (sorted.length > 15) console.log(`  ... and ${sorted.length - 15} more`);
+      break;
+    }
+
     default:
       console.log(`neo capture — Manage captured API traffic
 
@@ -429,7 +462,8 @@ commands.capture = async function(args) {
   neo capture clear [domain]              Clear captures (all or by domain)
   neo capture export [domain] [--since 1h] Export captures as JSON
   neo capture import <file>               Import captures from JSON file
-  neo capture watch [domain]              Live tail of new captures`);
+  neo capture watch [domain]              Live tail of new captures
+  neo capture summary                     Quick overview for AI agents`);
   }
 };
 
@@ -883,7 +917,7 @@ async function main() {
 
 Commands:
   neo status                              Overview of captured data
-  neo capture list|count|domains|detail|search|clear|export|import
+  neo capture list|count|domains|detail|search|stats|summary|clear|export|import
                                           Manage captured API traffic
   neo schema generate|show <domain>       API schema management
   neo exec <url> [options]                Execute fetch in browser context
