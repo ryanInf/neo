@@ -29,7 +29,7 @@ export interface CapturedRequest {
   trigger?: TriggerInfo;
   tabId: number;
   tabUrl: string;
-  source: 'fetch' | 'xhr' | 'websocket';
+  source: 'fetch' | 'xhr' | 'websocket' | 'eventsource';
 }
 
 export interface CapturedRequestRecord extends CapturedRequest {

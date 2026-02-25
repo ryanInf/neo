@@ -53,6 +53,48 @@ declare global {
 if (!window.__neoInterceptorInstalled) {
   window.__neoInterceptorInstalled = true;
 
+  // ── DOM trigger tracking ────────────────────────────────────────
+  // Track the last user interaction (click/submit) to correlate with API calls
+  let lastTrigger: { event: string; selector: string; text?: string; timestamp: number } | null = null;
+  const TRIGGER_WINDOW_MS = 2000; // Associate trigger with API calls within 2 seconds
+
+  function getSelector(el: Element): string {
+    if (el.id) return `#${el.id}`;
+    const tag = el.tagName.toLowerCase();
+    const cls = el.className && typeof el.className === 'string'
+      ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.')
+      : '';
+    return tag + cls;
+  }
+
+  function getElementText(el: Element): string | undefined {
+    const text = (el.textContent || '').trim().slice(0, 50);
+    return text || undefined;
+  }
+
+  function consumeTrigger(): CapturedRequest['trigger'] | undefined {
+    if (!lastTrigger) return undefined;
+    if (Date.now() - lastTrigger.timestamp > TRIGGER_WINDOW_MS) {
+      lastTrigger = null;
+      return undefined;
+    }
+    const t = { ...lastTrigger, event: lastTrigger.event as 'click' | 'input' | 'submit' };
+    // Don't null it — multiple API calls can share one trigger
+    return t;
+  }
+
+  document.addEventListener('click', (e) => {
+    const el = e.target as Element;
+    if (!el || !el.tagName) return;
+    lastTrigger = { event: 'click', selector: getSelector(el), text: getElementText(el), timestamp: Date.now() };
+  }, true);
+
+  document.addEventListener('submit', (e) => {
+    const el = e.target as Element;
+    if (!el) return;
+    lastTrigger = { event: 'submit', selector: getSelector(el), text: undefined, timestamp: Date.now() };
+  }, true);
+
   const originalFetch = window.fetch.bind(window);
   const originalXHRProto = XMLHttpRequest.prototype;
   const originalXHRopen = originalXHRProto.open;
@@ -271,6 +313,7 @@ if (!window.__neoInterceptorInstalled) {
         responseHeaders: parseHeaders(response.headers),
         responseBody,
         duration,
+        trigger: consumeTrigger(),
         tabId: -1,
         tabUrl: location.href,
         source: 'fetch',
@@ -294,6 +337,7 @@ if (!window.__neoInterceptorInstalled) {
         responseHeaders: {},
         responseBody: truncateText(errorText),
         duration,
+        trigger: consumeTrigger(),
         tabId: -1,
         tabUrl: location.href,
         source: 'fetch',
@@ -405,6 +449,7 @@ if (!window.__neoInterceptorInstalled) {
         responseHeaders: headers,
         responseBody: body,
         duration,
+        trigger: consumeTrigger(),
         tabId: -1,
         tabUrl: location.href,
         source: 'xhr',
