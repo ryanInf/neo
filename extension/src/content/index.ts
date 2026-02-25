@@ -123,7 +123,7 @@ function getCssSelector(element: Element): string {
 
   while (node && node.nodeType === Node.ELEMENT_NODE && depth < 8) {
     let selector = node.nodeName.toLowerCase();
-    const parent = node.parentElement;
+    const parentEl: Element | null = node.parentElement;
 
     if (node.className && typeof node.className === 'string') {
       const classes = node.className.split(' ').filter(Boolean).slice(0, 2);
@@ -132,8 +132,9 @@ function getCssSelector(element: Element): string {
       }
     }
 
-    if (parent) {
-      const sameTypeNodes = Array.from(parent.children).filter((child) => child.nodeName === node!.nodeName);
+    if (parentEl) {
+      const currentNode = node;
+      const sameTypeNodes = [...parentEl.children].filter((child) => child.nodeName === currentNode.nodeName);
       if (sameTypeNodes.length > 1) {
         const index = sameTypeNodes.indexOf(node);
         selector += `:nth-child(${index + 1})`;
@@ -141,7 +142,7 @@ function getCssSelector(element: Element): string {
     }
 
     path.unshift(selector);
-    node = parent;
+    node = parentEl;
     depth += 1;
   }
 

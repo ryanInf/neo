@@ -1,11 +1,11 @@
-import { defineConfig } from 'vite';
+import { defineConfig, Plugin } from 'vite';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 
 const extensionRoot = path.resolve(process.cwd(), 'extension');
 const sourceRoot = path.resolve(extensionRoot, 'src');
 
-function copyExtensionAssets() {
+function copyExtensionAssets(): Plugin {
   const assets = [
     { from: path.resolve(sourceRoot, 'manifest.json'), to: 'manifest.json' },
     { from: path.resolve(sourceRoot, 'popup/index.html'), to: 'popup.html' },

@@ -397,7 +397,7 @@ if (!window.__neoInterceptorInstalled) {
 
   originalXHRopen.call;
 
-  originalXHRProto.open = function open(method: string, url: string | URL, ...rest: any[]) {
+  originalXHRProto.open = function open(this: XMLHttpRequest, method: string, url: string | URL, ...rest: any[]) {
     const meta: XHRSnapshot = {
       method: method?.toUpperCase() || 'GET',
       url: toAbsoluteUrl(url),
@@ -410,10 +410,10 @@ if (!window.__neoInterceptorInstalled) {
     };
 
     (this as any)[XHR_META_KEY] = meta;
-    return originalXHRopen.call(this, method, url, ...rest);
+    return originalXHRopen.apply(this, [method, url, ...rest] as Parameters<typeof originalXHRopen>);
   } as typeof originalXHRopen;
 
-  originalXHRProto.setRequestHeader = function setRequestHeader(name: string, value: string) {
+  originalXHRProto.setRequestHeader = function setRequestHeader(this: XMLHttpRequest, name: string, value: string) {
     const meta = (this as any)[XHR_META_KEY] as XHRSnapshot | undefined;
     if (meta) {
       meta.headers[name] = value;
@@ -421,7 +421,7 @@ if (!window.__neoInterceptorInstalled) {
     return originalXHRsetHeader.call(this, name, value);
   } as typeof originalXHRsetHeader;
 
-  originalXHRProto.send = function send(body?: Document | XMLHttpRequestBodyInit | null) {
+  originalXHRProto.send = function send(this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
     const meta = (this as any)[XHR_META_KEY] as XHRSnapshot | undefined;
     const requestMeta = meta || ({
       method: 'GET',
