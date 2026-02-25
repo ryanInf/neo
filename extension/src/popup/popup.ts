@@ -106,11 +106,13 @@ async function renderCallsForDomain(domain: string): Promise<void> {
     const button = document.createElement('button');
     button.className = 'call-item';
     const isWs = call.method.startsWith('WS_');
-    const methodLabel = isWs ? `🔌 ${call.method}` : call.method.toUpperCase();
-    const statusLabel = isWs ? '' : `<span class="domain-count">${call.responseStatus || 0}</span>`;
+    const isSse = call.method.startsWith('SSE_');
+    const isRealtime = isWs || isSse;
+    const methodLabel = isRealtime ? `${isWs ? '🔌' : '📡'} ${call.method}` : call.method.toUpperCase();
+    const statusLabel = isRealtime ? '' : `<span class="domain-count">${call.responseStatus || 0}</span>`;
     button.innerHTML = `
       <div>
-        <strong${isWs ? ' style="color:#a78bfa"' : ''}>${escapeHtml(methodLabel)}</strong>
+        <strong${isWs ? ' style="color:#a78bfa"' : isSse ? ' style="color:#34d399"' : ''}>${escapeHtml(methodLabel)}</strong>
         ${statusLabel}
         <span style="float:right">${formatTime(call.timestamp)}</span>
       </div>
@@ -120,7 +122,8 @@ async function renderCallsForDomain(domain: string): Promise<void> {
     button.addEventListener('click', () => {
       selectedCall = call;
       const isWsCall = call.method.startsWith('WS_');
-      copyButtonsEl.style.display = isWsCall ? 'none' : 'flex';
+      const isSseCall = call.method.startsWith('SSE_');
+      copyButtonsEl.style.display = (isWsCall || isSseCall) ? 'none' : 'flex';
       requestDetailEl.textContent = JSON.stringify(formatForDisplay(call), null, 2);
       [...requestListEl.querySelectorAll('.call-item')].forEach((element) => {
         (element as HTMLButtonElement).style.background = '';

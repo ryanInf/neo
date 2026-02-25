@@ -388,7 +388,7 @@ commands.capture = async function(args) {
           const items = JSON.parse(r);
           for (const item of items.reverse()) {
             const time = new Date(item.timestamp).toLocaleTimeString();
-            const src = item.source === 'websocket' ? ' [ws]' : '';
+            const src = item.source === 'websocket' ? ' [ws]' : item.source === 'eventsource' ? ' [sse]' : '';
             console.log(`${time}  ${item.method} ${item.status} ${item.url.slice(0, 100)} (${item.duration}ms)${src}`);
             if (item.timestamp > lastTimestamp) lastTimestamp = item.timestamp;
           }

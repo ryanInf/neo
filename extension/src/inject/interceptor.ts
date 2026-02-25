@@ -618,4 +618,95 @@ if (!window.__neoInterceptorInstalled) {
   window.WebSocket.OPEN = OriginalWebSocket.OPEN;
   window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
   window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+
+  // ── EventSource (SSE) interception ───────────────────────────────
+  const OriginalEventSource = window.EventSource;
+  if (OriginalEventSource) {
+    window.EventSource = function NeoEventSource(
+      this: EventSource,
+      url: string | URL,
+      init?: EventSourceInit
+    ): EventSource {
+      const esUrl = typeof url === 'string' ? url : url.toString();
+      const es = init ? new OriginalEventSource(url, init) : new OriginalEventSource(url);
+      const domain = deriveDomain(esUrl);
+      const connectedAt = Date.now();
+      let messageCount = 0;
+      const MSG_CAP = 30; // capture first N messages per connection
+
+      // Capture connection open
+      es.addEventListener('open', () => {
+        emitCapture({
+          id: generateId(),
+          timestamp: Date.now(),
+          domain,
+          url: esUrl,
+          method: 'SSE_OPEN',
+          requestHeaders: {},
+          requestBody: init?.withCredentials ? { withCredentials: true } : undefined,
+          responseStatus: 200,
+          responseHeaders: {},
+          responseBody: undefined,
+          duration: Date.now() - connectedAt,
+          tabId: -1,
+          tabUrl: location.href,
+          source: 'eventsource',
+        });
+      });
+
+      // Capture messages (throttled)
+      es.addEventListener('message', (event: MessageEvent) => {
+        messageCount++;
+        if (messageCount > MSG_CAP) return;
+        const data = typeof event.data === 'string' ? event.data : String(event.data);
+        let parsed: unknown = data;
+        if (data.startsWith('{') || data.startsWith('[')) {
+          try { parsed = JSON.parse(data); } catch { /* keep as string */ }
+        }
+        emitCapture({
+          id: generateId(),
+          timestamp: Date.now(),
+          domain,
+          url: esUrl,
+          method: 'SSE_MSG',
+          requestHeaders: {},
+          requestBody: undefined,
+          responseStatus: 200,
+          responseHeaders: {},
+          responseBody: typeof parsed === 'string' ? truncateText(parsed) : parsed,
+          duration: Date.now() - connectedAt,
+          tabId: -1,
+          tabUrl: location.href,
+          source: 'eventsource',
+        });
+      });
+
+      // Capture errors
+      es.addEventListener('error', () => {
+        emitCapture({
+          id: generateId(),
+          timestamp: Date.now(),
+          domain,
+          url: esUrl,
+          method: 'SSE_ERROR',
+          requestHeaders: {},
+          requestBody: undefined,
+          responseStatus: 0,
+          responseHeaders: {},
+          responseBody: '[EventSource error]',
+          duration: Date.now() - connectedAt,
+          tabId: -1,
+          tabUrl: location.href,
+          source: 'eventsource',
+        });
+      });
+
+      return es;
+    } as unknown as typeof EventSource;
+
+    window.EventSource.prototype = OriginalEventSource.prototype;
+    window.EventSource.CONNECTING = OriginalEventSource.CONNECTING;
+    window.EventSource.OPEN = OriginalEventSource.OPEN;
+    window.EventSource.CLOSED = OriginalEventSource.CLOSED;
+  }
 }
