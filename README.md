@@ -97,6 +97,8 @@ node tools/neo.cjs api github.com notifications
 # Analyze API patterns
 node tools/neo.cjs flows x.com                      # Discover call sequence patterns
 node tools/neo.cjs flows x.com --window 5000        # Custom time window
+node tools/neo.cjs deps x.com                       # Find response→request data dependencies
+node tools/neo.cjs deps x.com --min-confidence 1    # Show even single-occurrence links
 node tools/neo.cjs suggest x.com                    # AI capability analysis for domain
 
 # Mock server
@@ -244,6 +246,7 @@ The interceptor ignores noise automatically:
 - [x] Import/export: cross-device capture migration
 - [x] Smart API call: `neo api` with schema lookup + auto-auth
 - [x] Flow analysis: `neo flows` discovers API call sequences
+- [x] Dependency chains: `neo deps` finds response→request data flow between endpoints
 - [x] Schema versioning with diff detection and history
 - [x] Diagnostics: `neo doctor` for setup verification
 - [x] Body field variability: schema tracks constant vs variable request fields

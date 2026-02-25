@@ -108,7 +108,7 @@ AI Agent 操作 Web App 现在有两条路，都有硬伤：
 - [ ] 双通道自动切换 — Neo 优先 → browser-use fallback
 - [ ] 多步 workflow 编排
 - [ ] AI 语义标注 — LLM 分析 endpoint 业务含义
-- [ ] API 依赖链发现 — A 的响应字段 → B 的参数
+- [x] API 依赖链发现 — `neo deps`：分析 response 字段如何流入后续 request
 
 **不做（至少现在）**
 - 签名/加密逆向
