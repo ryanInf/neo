@@ -463,6 +463,31 @@ commands.capture = async function(args) {
       break;
     }
 
+    case 'prune': {
+      const older = flags['older-than'] || flags.older || '7d';
+      const cutoff = Date.now() - parseDuration(older);
+      const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
+        var req = indexedDB.open("${DB_NAME}");
+        req.onsuccess = function() {
+          var db = req.result;
+          var tx = db.transaction("${STORE_NAME}", "readwrite");
+          var store = tx.objectStore("${STORE_NAME}");
+          var deleted = 0;
+          store.openCursor().onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) {
+              if (c.value.timestamp < ${cutoff}) { c.delete(); deleted++; }
+              c.continue();
+            } else { resolve(String(deleted)); }
+          };
+          tx.onerror = function() { resolve("Error: " + tx.error); };
+        };
+        req.onerror = function() { resolve("Error: " + req.error); };
+      })`, 60000);
+      console.log(`Pruned ${r} captures older than ${older}`);
+      break;
+    }
+
     default:
       console.log(`neo capture — Manage captured API traffic
 
@@ -476,7 +501,8 @@ commands.capture = async function(args) {
   neo capture export [domain] [--since 1h] Export captures as JSON
   neo capture import <file>               Import captures from JSON file
   neo capture watch [domain]              Live tail of new captures
-  neo capture summary                     Quick overview for AI agents`);
+  neo capture summary                     Quick overview for AI agents
+  neo capture prune [--older-than 7d]     Delete old captures`);
   }
 };
 
@@ -653,9 +679,29 @@ commands.schema = async function(args) {
       if (schema.error) { console.error('Error:', schema.error); process.exit(1); }
       if (!schema.totalCaptures) { console.error(`No captures for ${domain}`); process.exit(1); }
       
-      // Save to schema dir
+      // Save to schema dir (with diff detection)
       fs.mkdirSync(SCHEMA_DIR, { recursive: true });
       const outFile = path.join(SCHEMA_DIR, `${domain}.json`);
+      if (fs.existsSync(outFile)) {
+        try {
+          const prev = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+          const prevPaths = new Set((prev.endpoints || []).map(e => `${e.method} ${e.pathPattern}`));
+          const newPaths = new Set((schema.endpoints || []).map(e => `${e.method} ${e.pathPattern}`));
+          const added = [...newPaths].filter(p => !prevPaths.has(p));
+          const removed = [...prevPaths].filter(p => !newPaths.has(p));
+          if (added.length || removed.length) {
+            console.error(`Schema diff: +${added.length} -${removed.length} endpoints`);
+            added.forEach(p => console.error(`  + ${p}`));
+            removed.forEach(p => console.error(`  - ${p}`));
+          }
+          // Archive previous version
+          const histDir = path.join(SCHEMA_DIR, '.history');
+          fs.mkdirSync(histDir, { recursive: true });
+          const ts = prev.generatedAt ? prev.generatedAt.replace(/[:.]/g, '-') : Date.now();
+          fs.writeFileSync(path.join(histDir, `${domain}.${ts}.json`), fs.readFileSync(outFile));
+        } catch {}
+      }
+      schema.version = (schema.version || 0) + 1;
       fs.writeFileSync(outFile, JSON.stringify(schema, null, 2));
       console.error(`Schema saved to ${outFile} (${schema.totalCaptures} captures → ${schema.uniqueEndpoints} endpoints)`);
       console.log(JSON.stringify(schema, null, 2));
@@ -700,7 +746,8 @@ commands.schema = async function(args) {
         try {
           const s = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, f), 'utf8'));
           const age = Math.round((Date.now() - new Date(s.generatedAt).getTime()) / 3600000);
-          console.log(`${s.domain}  ${s.uniqueEndpoints} endpoints  ${s.totalCaptures} captures  ${age}h ago`);
+          const v = s.version ? `v${s.version}` : 'v1';
+          console.log(`${s.domain}  ${s.uniqueEndpoints} endpoints  ${s.totalCaptures} captures  ${age}h ago  ${v}`);
         } catch { console.log(f); }
       }
       break;
@@ -1292,6 +1339,63 @@ Options:
   }
 };
 
+// neo doctor — diagnose setup issues
+commands.doctor = async function() {
+  const checks = [];
+  function check(name, fn) { checks.push({ name, fn }); }
+
+  check('Chrome CDP endpoint', async () => {
+    const resp = await fetch(`${CDP_URL}/json/version`);
+    const info = await resp.json();
+    return `${info.Browser} (${CDP_URL})`;
+  });
+
+  check('Browser tabs', async () => {
+    const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+    const pages = tabs.filter(t => t.type === 'page');
+    return `${pages.length} page(s), ${tabs.length} total targets`;
+  });
+
+  check('Neo extension service worker', async () => {
+    const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+    const sw = tabs.find(t => t.type === 'service_worker' && t.url.includes(NEO_EXTENSION_ID));
+    if (!sw) throw new Error('Not found — install extension or check NEO_EXTENSION_ID');
+    return `OK (${NEO_EXTENSION_ID.slice(0, 8)}…)`;
+  });
+
+  check('IndexedDB captures', async () => {
+    const wsUrl = await findExtensionWs();
+    const count = await cdpEval(wsUrl, dbEval(`
+      store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
+    `));
+    return `${count} captures stored`;
+  });
+
+  check('Schema directory', async () => {
+    if (!fs.existsSync(SCHEMA_DIR)) throw new Error(`Missing: ${SCHEMA_DIR}`);
+    const files = fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json'));
+    return `${files.length} schema(s) in ${SCHEMA_DIR}`;
+  });
+
+  check('WebSocket bridge port', async () => {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket('ws://127.0.0.1:9234');
+      const timer = setTimeout(() => { ws.close(); resolve('Not running (optional)'); }, 2000);
+      ws.on('open', () => { clearTimeout(timer); ws.close(); resolve('Running on :9234'); });
+      ws.on('error', () => { clearTimeout(timer); resolve('Not running (optional)'); });
+    });
+  });
+
+  for (const { name, fn } of checks) {
+    try {
+      const result = await fn();
+      console.log(`  ✓  ${name}: ${result}`);
+    } catch (err) {
+      console.log(`  ✗  ${name}: ${err.message}`);
+    }
+  }
+};
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
@@ -1302,7 +1406,7 @@ async function main() {
 
 Commands:
   neo status                              Overview of captured data
-  neo capture list|count|domains|detail|search|stats|summary|clear|export|import
+  neo capture list|count|domains|detail|search|stats|summary|prune|clear|export|import
                                           Manage captured API traffic
   neo schema generate|show <domain>       API schema management
   neo exec <url> [options]                Execute fetch in browser context
@@ -1313,6 +1417,7 @@ Commands:
   neo api <domain> <search-term>          Smart API call (schema lookup + auto-auth)
   neo flows <domain> [--window ms]        Discover API call sequence patterns
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
+  neo doctor                              Diagnose setup issues
 
 Options (for exec):
   --method GET|POST|PUT|DELETE            HTTP method (default: GET)
