@@ -231,6 +231,34 @@ The interceptor ignores noise automatically:
 - Browser internals (chrome-extension://, data:, blob:)
 - **Rate limiting**: Max 3 captures per URL pattern per minute (prevents polling endpoint bloat)
 
+## Security & Privacy
+
+Neo runs entirely locally — no external servers, no telemetry, no data leaves your machine.
+
+**What Neo captures:** Every fetch/XHR/WebSocket call your browser makes on every website. This is powerful but invasive by design.
+
+**Auth header redaction (v1.1.0+):** Auth header values (Bearer tokens, CSRF tokens, cookies, session IDs) are redacted at capture time before storage. IndexedDB only stores header *names*, not values. When `--auto-headers` executes an API call, it fetches live auth headers from the browser in real-time via CDP — never replays stored credentials.
+
+**What you should know:**
+
+| Aspect | Detail |
+|--------|--------|
+| **Capture scope** | `<all_urls>` — Neo sees traffic on *every* website, including banking, email, medical portals |
+| **Content script** | Runs in `MAIN` world (shares JS context with pages) to intercept fetch/XHR |
+| **CDP port** | CLI requires Chrome on port 9222 — any local process can connect to this port |
+| **Response bodies** | Stored in IndexedDB (truncated to 100KB) — may contain personal data from API responses |
+| **Schema files** | Store only endpoint structure (paths, header names, response shapes) — no credentials or user data |
+| **Export** | `neo capture export` redacts auth by default; `--include-auth` requires explicit opt-in |
+
+**Recommendations:**
+
+- Review captured domains periodically: `neo capture domains`
+- Prune sensitive captures: `neo capture clear banksite.com`
+- Don't install Neo on shared machines where others have local access
+- The CDP port (9222) should not be exposed beyond localhost
+
+Neo is a developer tool that trades privacy surface for capability. Use it knowingly.
+
 ## Tech Stack
 
 - TypeScript, Vite (multi-entry build)
