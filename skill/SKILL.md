@@ -1,3 +1,8 @@
+---
+name: neo
+description: Turn any web app into an AI-callable tool. Chrome extension passively captures APIs (fetch, XHR, WebSocket, SSE) with DOM trigger correlation. CLI to query, replay, and execute captured APIs with automatic authentication. Use when interacting with websites, discovering APIs, or replacing slow browser-use with direct API calls.
+---
+
 # Neo — Web App API Discovery & Execution
 
 ## What
