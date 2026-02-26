@@ -100,6 +100,7 @@ node tools/neo.cjs flows x.com --window 5000        # Custom time window
 node tools/neo.cjs deps x.com                       # Find response→request data dependencies
 node tools/neo.cjs deps x.com --min-confidence 1    # Show even single-occurrence links
 node tools/neo.cjs suggest x.com                    # AI capability analysis for domain
+node tools/neo.cjs export-skill x.com               # Generate agent-ready API reference (Markdown)
 
 # Mock server
 node tools/neo.cjs mock x.com                       # Start mock server from schema
@@ -250,7 +251,9 @@ The interceptor ignores noise automatically:
 - [x] Schema versioning with diff detection and history
 - [x] Diagnostics: `neo doctor` for setup verification
 - [x] Body field variability: schema tracks constant vs variable request fields
-- [x] Pure function extraction + 47 unit tests + CI
+- [x] Pure function extraction + 73 unit tests + CI
+- [x] Agent skill export: `neo export-skill` generates SKILL.md-ready API reference
+- [x] Mock server: `neo mock` generates local HTTP server from schema
 - [x] HAR 1.2 export format for Postman/Charles/devtools interop
 - [x] OpenAPI 3.0 spec generation from captured schemas
 - [x] Batch schema generation (`--all`)
