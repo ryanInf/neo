@@ -34,6 +34,40 @@ const STORE_NAME = 'capturedRequests';
 const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || 'ikikhldfkbfmcbandaagjomhchlehjap';
 const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'clawd/skills/neo/schemas');
 const WORKFLOW_FILE_EXT = '.workflows.json';
+const SESSION_FILE = '/tmp/neo-sessions.json';
+const DEFAULT_SESSION_NAME = '__default__';
+
+function loadSessions() {
+  if (!fs.existsSync(SESSION_FILE)) return {};
+  try {
+    const raw = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  const safeSessions = (!sessions || typeof sessions !== 'object' || Array.isArray(sessions))
+    ? {}
+    : sessions;
+  fs.writeFileSync(SESSION_FILE, `${JSON.stringify(safeSessions, null, 2)}\n`, 'utf8');
+}
+
+function getSession(name = DEFAULT_SESSION_NAME) {
+  const sessions = loadSessions();
+  return sessions[name] || null;
+}
+
+function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
+  const sessions = loadSessions();
+  sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
+  saveSessions(sessions);
+  return sessions[name];
+}
 
 // ─── CDP Helpers ────────────────────────────────────────────────
 
