@@ -3,11 +3,35 @@
 // Run: node tools/neo.test.cjs
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 let pass = 0, fail = 0;
+const pendingTests = [];
 
 function test(name, fn) {
-  try { fn(); pass++; console.log(`  ✓ ${name}`); }
-  catch (e) { fail++; console.log(`  ✗ ${name}: ${e.message}`); }
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      pendingTests.push(
+        result
+          .then(() => {
+            pass++;
+            console.log(`  ✓ ${name}`);
+          })
+          .catch((e) => {
+            fail++;
+            console.log(`  ✗ ${name}: ${e.message}`);
+          })
+      );
+      return;
+    }
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    fail++;
+    console.log(`  ✗ ${name}: ${e.message}`);
+  }
 }
 
 // ─── Extract functions (copy-paste to keep neo.cjs untouched) ───
@@ -21,6 +45,17 @@ const AUTH_HEADER_PATTERNS = [
 
 const REDACTED_HEADER_VALUE = '[REDACTED]';
 const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+const SESSION_FILE = path.join(os.tmpdir(), `neo-sessions-test-${process.pid}.json`);
+const DEFAULT_SESSION_NAME = '__default__';
+const ELECTRON_APPS = Object.freeze({
+  slack: Object.freeze(['/usr/bin/slack', 'slack']),
+  code: Object.freeze(['/usr/bin/code', 'code']),
+  vscode: Object.freeze(['/usr/bin/code', 'code']),
+  discord: Object.freeze(['/usr/bin/discord', 'discord']),
+  notion: Object.freeze(['/usr/bin/notion', 'notion']),
+  figma: Object.freeze([]),
+  feishu: Object.freeze(['/opt/bytedance/feishu/feishu', 'feishu']),
+});
 
 function isAuthHeader(name) {
   const lk = String(name || '').toLowerCase();
@@ -104,17 +139,430 @@ function parseDuration(str) {
 function parseArgs(argv) {
   const positional = [];
   const flags = {};
+  let sessionName = DEFAULT_SESSION_NAME;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
+    const current = argv[i];
+    if (current.startsWith('--')) {
+      const eqIndex = current.indexOf('=');
+      const hasInlineValue = eqIndex > 2;
+      const key = hasInlineValue ? current.slice(2, eqIndex) : current.slice(2);
+      const inlineValue = hasInlineValue ? current.slice(eqIndex + 1) : null;
       const next = argv[i + 1];
-      if (next && !next.startsWith('--')) { flags[key] = next; i++; }
-      else { flags[key] = true; }
+      if (key === 'session') {
+        if (hasInlineValue) {
+          sessionName = inlineValue || DEFAULT_SESSION_NAME;
+        } else if (next && !next.startsWith('--')) {
+          sessionName = next;
+          i++;
+        } else {
+          sessionName = DEFAULT_SESSION_NAME;
+        }
+        continue;
+      }
+      if (hasInlineValue) {
+        flags[key] = inlineValue;
+      } else if (next && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
     } else {
-      positional.push(argv[i]);
+      positional.push(current);
     }
   }
-  return { positional, flags };
+  return { positional, flags, sessionName };
+}
+
+function stripGlobalSessionFlag(argv) {
+  const clean = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--session') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) i++;
+      continue;
+    }
+    if (arg.startsWith('--session=')) continue;
+    clean.push(arg);
+  }
+  return clean;
+}
+
+function loadSessions() {
+  if (!fs.existsSync(SESSION_FILE)) return {};
+  try {
+    const raw = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  const safeSessions = (!sessions || typeof sessions !== 'object' || Array.isArray(sessions))
+    ? {}
+    : sessions;
+  fs.writeFileSync(SESSION_FILE, `${JSON.stringify(safeSessions, null, 2)}\n`, 'utf8');
+}
+
+function getSession(name = DEFAULT_SESSION_NAME) {
+  const sessions = loadSessions();
+  return sessions[name] || null;
+}
+
+function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
+  const sessions = loadSessions();
+  sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
+  saveSessions(sessions);
+  return sessions[name];
+}
+
+function normalizeElectronAppName(appName) {
+  const normalized = String(appName || '').trim().toLowerCase();
+  if (normalized === 'vscode') return 'code';
+  return normalized;
+}
+
+function resolveElectronExecutable(appName, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const commandExistsFn = typeof deps.commandExists === 'function' ? deps.commandExists : () => false;
+  const normalizedName = normalizeElectronAppName(appName);
+  if (!normalizedName || !Object.prototype.hasOwnProperty.call(ELECTRON_APPS, normalizedName)) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unknown-app',
+      candidates: [],
+    };
+  }
+  const candidates = Array.isArray(ELECTRON_APPS[normalizedName]) ? ELECTRON_APPS[normalizedName] : [];
+  if (!candidates.length) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unsupported-on-linux',
+      candidates,
+    };
+  }
+  for (const candidate of candidates) {
+    if (candidate.includes('/')) {
+      if (existsSyncFn(candidate)) {
+        return { app: normalizedName, executable: candidate, error: null, candidates };
+      }
+      continue;
+    }
+    if (commandExistsFn(candidate)) {
+      return { app: normalizedName, executable: candidate, error: null, candidates };
+    }
+  }
+  return {
+    app: normalizedName,
+    executable: null,
+    error: 'executable-not-found',
+    candidates,
+  };
+}
+
+function shellEscape(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function extractRemoteDebugPort(text) {
+  const input = String(text || '');
+  const match = input.match(/--remote-debugging-port(?:=|\s+)(\d{1,5})/);
+  if (!match) return null;
+  const port = parseInt(match[1], 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+function findElectronDebugPort(appName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : () => {
+    throw new Error('execSync stub required');
+  };
+  const normalized = String(appName || '').trim();
+  if (!normalized) return null;
+  const command = `ps aux | grep ${shellEscape(normalized)} | grep -- '--remote-debugging-port' | grep -v grep`;
+  try {
+    const output = String(execSyncFn(command) || '');
+    return extractRemoteDebugPort(output);
+  } catch {
+    return null;
+  }
+}
+
+function parseTabTargets(targets) {
+  const source = Array.isArray(targets) ? targets : [];
+  return source.map((target, index) => {
+    const item = target && typeof target === 'object' ? target : {};
+    const id = item.id || item.targetId || '';
+    return {
+      index,
+      type: String(item.type || 'unknown'),
+      id: String(id || ''),
+      title: String(item.title || ''),
+      url: String(item.url || ''),
+      webSocketDebuggerUrl: String(item.webSocketDebuggerUrl || ''),
+    };
+  });
+}
+
+function findTabTargetByUrlPattern(targets, pattern) {
+  const list = Array.isArray(targets) ? targets : [];
+  const input = String(pattern || '');
+  if (!input) return null;
+  return list.find(target => target.url.includes(input)) || null;
+}
+
+function loadInjectScriptSource(deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : () => '';
+  const rootDir = deps.rootDir || '/tmp/project';
+  const primary = path.join(rootDir, 'extension', 'inject.js');
+  const fallback = path.join(rootDir, 'extension-dist', 'content.js');
+
+  if (existsSyncFn(primary)) {
+    return { sourcePath: primary, source: readFileSyncFn(primary, 'utf8') };
+  }
+  if (existsSyncFn(fallback)) {
+    return { sourcePath: fallback, source: readFileSyncFn(fallback, 'utf8') };
+  }
+  throw new Error(`Inject script not found. Tried: ${primary} and ${fallback}`);
+}
+
+function buildInjectScript(sourceCode) {
+  const raw = String(sourceCode || '');
+  return `(function() {
+  try {
+    if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
+      globalThis.__NEO_CAPTURES__ = [];
+    }
+    if (typeof globalThis.__neoMiniReporter !== 'function') {
+      globalThis.__neoMiniReporter = function(event, payload) {
+        try {
+          console.debug('[neo:inject]', event, payload || {});
+        } catch {}
+      };
+    }
+    globalThis.__neoMiniReporter('inject:start', { captures: globalThis.__NEO_CAPTURES__.length });
+    (function() {
+${raw}
+    }).call(globalThis);
+    globalThis.__neoMiniReporter('inject:ready', { captures: globalThis.__NEO_CAPTURES__.length });
+    return { ok: true, captures: globalThis.__NEO_CAPTURES__.length };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  }
+})();`;
+}
+
+function resetSessionFile() {
+  try { fs.unlinkSync(SESSION_FILE); } catch {}
+}
+
+function axValueToString(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (typeof value === 'object' && value.value !== undefined && value.value !== null) {
+    return String(value.value);
+  }
+  return '';
+}
+
+function assignRefs(axTreeNodes) {
+  const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
+  const nodeById = new Map();
+  const childIds = new Set();
+
+  for (const node of sourceNodes) {
+    if (node.nodeId === undefined || node.nodeId === null) continue;
+    nodeById.set(String(node.nodeId), node);
+  }
+
+  for (const node of sourceNodes) {
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      childIds.add(String(childId));
+    }
+  }
+
+  const roots = sourceNodes.filter((node) => {
+    if (node.nodeId === undefined || node.nodeId === null) return true;
+    return !childIds.has(String(node.nodeId));
+  });
+
+  const visited = new Set();
+  const nodes = [];
+  const refs = {};
+  let nextRef = 1;
+
+  function visit(node, depth) {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    const ref = `@e${nextRef++}`;
+    const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
+    const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
+    const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
+    const bounds = node.bounds && typeof node.bounds === 'object' ? node.bounds : null;
+
+    nodes.push({ ref, depth, role, name, backendDOMNodeId, bounds });
+    refs[ref] = { backendDOMNodeId, role, name, bounds };
+
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      const childNode = nodeById.get(String(childId));
+      if (childNode) visit(childNode, depth + 1);
+    }
+  }
+
+  for (const root of roots) visit(root, 0);
+  for (const node of sourceNodes) {
+    if (!visited.has(node)) visit(node, 0);
+  }
+
+  return { nodes, refs };
+}
+
+function formatSnapshot(nodes) {
+  const rows = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node || typeof node !== 'object') continue;
+    const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
+    const indent = '  '.repeat(depth);
+    const ref = String(node.ref || '@e?');
+    const role = String(node.role || 'unknown');
+    const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
+    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+  }
+  return rows.join('\n');
+}
+
+function getBackendNodeIdFromRef(session, ref) {
+  const normalizedRef = String(ref || '');
+  if (!normalizedRef.startsWith('@')) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
+    ? refs[normalizedRef].backendDOMNodeId
+    : null;
+  if (!backendDOMNodeId) {
+    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+  }
+  return backendDOMNodeId;
+}
+
+function centerFromQuad(quad) {
+  if (!Array.isArray(quad) || quad.length < 8) return null;
+  const xs = [quad[0], quad[2], quad[4], quad[6]].map(Number).filter(Number.isFinite);
+  const ys = [quad[1], quad[3], quad[5], quad[7]].map(Number).filter(Number.isFinite);
+  if (xs.length !== 4 || ys.length !== 4) return null;
+  const x = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+  const y = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+  return { x, y };
+}
+
+async function resolveRef(sessionName, ref, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : (() => Promise.reject(new Error('Missing cdpSend stub')));
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const backendDOMNodeId = getBackendNodeIdFromRef(session, ref);
+  const resolved = await sendFn(session.pageWsUrl, 'DOM.resolveNode', { backendNodeId: backendDOMNodeId });
+  const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (!objectId) {
+    throw new Error(`Failed to resolve node for ${ref}`);
+  }
+
+  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  const quad = boxModel && boxModel.model && boxModel.model.content;
+  const center = centerFromQuad(quad);
+  if (!center) {
+    throw new Error(`Failed to get box model for ${ref}`);
+  }
+
+  return {
+    objectId,
+    x: center.x,
+    y: center.y,
+    backendDOMNodeId,
+  };
+}
+
+const PRESS_KEY_MAP = {
+  enter: { key: 'Enter', code: 'Enter' },
+  tab: { key: 'Tab', code: 'Tab' },
+  escape: { key: 'Escape', code: 'Escape' },
+  esc: { key: 'Escape', code: 'Escape' },
+  backspace: { key: 'Backspace', code: 'Backspace' },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp' },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown' },
+  arrowleft: { key: 'ArrowLeft', code: 'ArrowLeft' },
+  arrowright: { key: 'ArrowRight', code: 'ArrowRight' },
+  space: { key: ' ', code: 'Space', text: ' ' },
+  delete: { key: 'Delete', code: 'Delete' },
+  home: { key: 'Home', code: 'Home' },
+  end: { key: 'End', code: 'End' },
+  pageup: { key: 'PageUp', code: 'PageUp' },
+  pagedown: { key: 'PageDown', code: 'PageDown' },
+};
+
+function parsePressKey(rawKey) {
+  const input = String(rawKey || '').trim();
+  if (!input) return null;
+
+  const parts = input.split('+').map(part => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const keyPart = parts.pop();
+  const lowerKey = String(keyPart || '').toLowerCase();
+  let mapped = PRESS_KEY_MAP[lowerKey] ? { ...PRESS_KEY_MAP[lowerKey] } : null;
+
+  if (!mapped && /^[a-z]$/i.test(keyPart)) {
+    const char = keyPart.toLowerCase();
+    mapped = { key: char, code: `Key${char.toUpperCase()}` };
+  }
+
+  if (!mapped) return null;
+
+  let modifiers = 0;
+  for (const token of parts) {
+    const lower = token.toLowerCase();
+    if (lower === 'ctrl' || lower === 'control') {
+      modifiers |= 2;
+      continue;
+    }
+    if (lower === 'alt') {
+      modifiers |= 1;
+      continue;
+    }
+    if (lower === 'meta' || lower === 'cmd' || lower === 'command') {
+      modifiers |= 4;
+      continue;
+    }
+    if (lower === 'shift') {
+      modifiers |= 8;
+      continue;
+    }
+    return null;
+  }
+
+  if (modifiers) mapped.modifiers = modifiers;
+  return mapped;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────
@@ -234,6 +682,368 @@ test('mixed positional and flags', () => {
   const r = parseArgs(['capture', 'list', '--limit', '5', 'github.com']);
   assert.deepStrictEqual(r.positional, ['capture', 'list', 'github.com']);
   assert.strictEqual(r.flags.limit, '5');
+});
+test('supports global --session with separated value', () => {
+  const r = parseArgs(['--session', 'team-a', 'connect', '9225']);
+  assert.strictEqual(r.sessionName, 'team-a');
+  assert.deepStrictEqual(r.positional, ['connect', '9225']);
+});
+test('supports global --session with inline value', () => {
+  const r = parseArgs(['--session=team-b', 'discover']);
+  assert.strictEqual(r.sessionName, 'team-b');
+  assert.deepStrictEqual(r.positional, ['discover']);
+});
+test('stripGlobalSessionFlag removes session arguments only', () => {
+  const cleaned = stripGlobalSessionFlag(['--session', 'dev', 'connect', '--json', '9222']);
+  assert.deepStrictEqual(cleaned, ['connect', '--json', '9222']);
+});
+
+console.log('\nElectron app mapping:');
+test('ELECTRON_APPS includes expected Linux candidates', () => {
+  assert.deepStrictEqual(ELECTRON_APPS.slack, ['/usr/bin/slack', 'slack']);
+  assert.deepStrictEqual(ELECTRON_APPS.code, ['/usr/bin/code', 'code']);
+  assert.deepStrictEqual(ELECTRON_APPS.vscode, ['/usr/bin/code', 'code']);
+  assert.deepStrictEqual(ELECTRON_APPS.discord, ['/usr/bin/discord', 'discord']);
+  assert.deepStrictEqual(ELECTRON_APPS.notion, ['/usr/bin/notion', 'notion']);
+  assert.deepStrictEqual(ELECTRON_APPS.feishu, ['/opt/bytedance/feishu/feishu', 'feishu']);
+  assert.deepStrictEqual(ELECTRON_APPS.figma, []);
+});
+
+test('normalizeElectronAppName maps vscode to code', () => {
+  assert.strictEqual(normalizeElectronAppName('vscode'), 'code');
+  assert.strictEqual(normalizeElectronAppName('code'), 'code');
+});
+
+test('resolveElectronExecutable prefers existing absolute paths', () => {
+  const out = resolveElectronExecutable('slack', {
+    existsSync: (p) => p === '/usr/bin/slack',
+    commandExists: () => false,
+  });
+  assert.strictEqual(out.executable, '/usr/bin/slack');
+  assert.strictEqual(out.error, null);
+});
+
+test('resolveElectronExecutable falls back to command lookup', () => {
+  const out = resolveElectronExecutable('feishu', {
+    existsSync: () => false,
+    commandExists: (name) => name === 'feishu',
+  });
+  assert.strictEqual(out.executable, 'feishu');
+  assert.strictEqual(out.error, null);
+});
+
+test('resolveElectronExecutable reports unsupported app', () => {
+  const out = resolveElectronExecutable('figma', {
+    existsSync: () => false,
+    commandExists: () => false,
+  });
+  assert.strictEqual(out.executable, null);
+  assert.strictEqual(out.error, 'unsupported-on-linux');
+});
+
+console.log('\nElectron connect parsing:');
+test('extractRemoteDebugPort parses --remote-debugging-port with equals', () => {
+  const text = 'feishu --remote-debugging-port=9225 --foo bar';
+  assert.strictEqual(extractRemoteDebugPort(text), 9225);
+});
+
+test('extractRemoteDebugPort parses --remote-debugging-port with space', () => {
+  const text = 'feishu --remote-debugging-port 9226';
+  assert.strictEqual(extractRemoteDebugPort(text), 9226);
+});
+
+test('findElectronDebugPort extracts port from ps output', () => {
+  let captured = '';
+  const port = findElectronDebugPort('feishu', {
+    execSync: (cmd) => {
+      captured = cmd;
+      return 'fourier  123  1.2  feishu --remote-debugging-port=9225';
+    },
+  });
+  assert.strictEqual(port, 9225);
+  assert.ok(captured.includes('ps aux | grep'));
+  assert.ok(captured.includes("'feishu'"));
+});
+
+test('findElectronDebugPort returns null when no debug flag is found', () => {
+  const port = findElectronDebugPort('feishu', {
+    execSync: () => 'fourier  123  1.2  feishu --flag without-port',
+  });
+  assert.strictEqual(port, null);
+});
+
+console.log('\nTab list parsing:');
+test('parseTabTargets normalizes target fields and preserves order', () => {
+  const targets = parseTabTargets([
+    {
+      type: 'page',
+      id: 'tab-1',
+      title: 'Home',
+      url: 'https://example.com',
+      webSocketDebuggerUrl: 'ws://localhost:9222/devtools/page/tab-1',
+    },
+    {
+      type: 'service_worker',
+      targetId: 'worker-1',
+      title: '',
+      url: 'chrome-extension://id/bg.js',
+    },
+  ]);
+  assert.strictEqual(targets.length, 2);
+  assert.deepStrictEqual(targets[0], {
+    index: 0,
+    type: 'page',
+    id: 'tab-1',
+    title: 'Home',
+    url: 'https://example.com',
+    webSocketDebuggerUrl: 'ws://localhost:9222/devtools/page/tab-1',
+  });
+  assert.deepStrictEqual(targets[1], {
+    index: 1,
+    type: 'service_worker',
+    id: 'worker-1',
+    title: '',
+    url: 'chrome-extension://id/bg.js',
+    webSocketDebuggerUrl: '',
+  });
+});
+
+test('parseTabTargets handles invalid input defensively', () => {
+  assert.deepStrictEqual(parseTabTargets(null), []);
+  const one = parseTabTargets([null])[0];
+  assert.deepStrictEqual(one, {
+    index: 0,
+    type: 'unknown',
+    id: '',
+    title: '',
+    url: '',
+    webSocketDebuggerUrl: '',
+  });
+});
+
+test('findTabTargetByUrlPattern matches first URL include', () => {
+  const targets = parseTabTargets([
+    { type: 'page', id: '1', url: 'https://example.com/home' },
+    { type: 'page', id: '2', url: 'https://example.com/settings' },
+  ]);
+  const matched = findTabTargetByUrlPattern(targets, '/settings');
+  assert.strictEqual(matched.id, '2');
+});
+
+console.log('\nInject script loading:');
+test('loadInjectScriptSource prefers extension/inject.js', () => {
+  const loaded = loadInjectScriptSource({
+    rootDir: '/repo',
+    existsSync: (p) => p === '/repo/extension/inject.js',
+    readFileSync: (p) => `from:${p}`,
+  });
+  assert.strictEqual(loaded.sourcePath, '/repo/extension/inject.js');
+  assert.strictEqual(loaded.source, 'from:/repo/extension/inject.js');
+});
+
+test('loadInjectScriptSource falls back to extension-dist/content.js', () => {
+  const loaded = loadInjectScriptSource({
+    rootDir: '/repo',
+    existsSync: (p) => p === '/repo/extension-dist/content.js',
+    readFileSync: (p) => `from:${p}`,
+  });
+  assert.strictEqual(loaded.sourcePath, '/repo/extension-dist/content.js');
+  assert.strictEqual(loaded.source, 'from:/repo/extension-dist/content.js');
+});
+
+test('buildInjectScript wraps source with reporter and capture array', () => {
+  const script = buildInjectScript('globalThis.__NEO_CAPTURES__.push({ ok: true });');
+  assert.ok(script.includes('__NEO_CAPTURES__'));
+  assert.ok(script.includes('__neoMiniReporter'));
+  assert.ok(script.includes('inject:ready'));
+});
+
+console.log('\nsession store:');
+test('loadSessions returns empty object when session file is missing', () => {
+  resetSessionFile();
+  assert.deepStrictEqual(loadSessions(), {});
+});
+test('saveSessions and loadSessions keep object payload', () => {
+  resetSessionFile();
+  saveSessions({ a: { cdpUrl: 'http://localhost:9222' } });
+  assert.deepStrictEqual(loadSessions(), { a: { cdpUrl: 'http://localhost:9222' } });
+});
+test('setSession writes default session when name is omitted', () => {
+  resetSessionFile();
+  const payload = {
+    cdpUrl: 'http://localhost:9222',
+    pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+    tabId: 'tab-1',
+    refs: {},
+  };
+  setSession(undefined, payload);
+  const sessions = loadSessions();
+  assert.deepStrictEqual(sessions[DEFAULT_SESSION_NAME], payload);
+});
+test('setSession keeps existing sessions and getSession resolves by name', () => {
+  resetSessionFile();
+  setSession('alpha', { cdpUrl: 'http://localhost:9222', refs: {} });
+  setSession('beta', { cdpUrl: 'http://localhost:9223', refs: {} });
+  const alpha = getSession('alpha');
+  const beta = getSession('beta');
+  assert.strictEqual(alpha.cdpUrl, 'http://localhost:9222');
+  assert.strictEqual(beta.cdpUrl, 'http://localhost:9223');
+});
+test('getSession returns null for unknown session name', () => {
+  resetSessionFile();
+  saveSessions({ alpha: { cdpUrl: 'http://localhost:9222' } });
+  assert.strictEqual(getSession('missing'), null);
+});
+test('saveSessions normalizes invalid input to empty object', () => {
+  resetSessionFile();
+  saveSessions(null);
+  assert.deepStrictEqual(loadSessions(), {});
+});
+
+console.log('\nassignRefs + formatSnapshot:');
+test('assignRefs traverses tree in preorder with depth and refs map', () => {
+  const tree = [
+    {
+      nodeId: '1',
+      role: { value: 'RootWebArea' },
+      name: { value: 'Main App' },
+      childIds: ['2', '3'],
+      backendDOMNodeId: 101,
+    },
+    {
+      nodeId: '2',
+      role: { value: 'button' },
+      name: { value: ' Submit ' },
+      backendDOMNodeId: 102,
+      childIds: [],
+      bounds: { x: 10, y: 20, width: 30, height: 40 },
+    },
+    {
+      nodeId: '3',
+      role: { value: 'link' },
+      name: { value: 'Home' },
+      backendDOMNodeId: 103,
+      childIds: ['4'],
+    },
+    {
+      nodeId: '4',
+      role: { value: 'textbox' },
+      name: { value: 'Search' },
+      backendDOMNodeId: 104,
+      childIds: [],
+    },
+  ];
+  const result = assignRefs(tree);
+  assert.strictEqual(result.nodes.length, 4);
+  assert.deepStrictEqual(result.nodes.map(n => n.ref), ['@e1', '@e2', '@e3', '@e4']);
+  assert.deepStrictEqual(result.nodes.map(n => n.depth), [0, 1, 1, 2]);
+  assert.strictEqual(result.refs['@e1'].backendDOMNodeId, 101);
+  assert.strictEqual(result.refs['@e2'].role, 'button');
+  assert.strictEqual(result.refs['@e2'].name, 'Submit');
+  assert.deepStrictEqual(result.refs['@e2'].bounds, { x: 10, y: 20, width: 30, height: 40 });
+});
+
+test('assignRefs includes disconnected nodes and normalizes missing fields', () => {
+  const result = assignRefs([
+    { nodeId: '1', role: null, name: null, childIds: ['2'] },
+    { nodeId: '2', role: { value: 'Button' }, name: { value: 'Click' }, childIds: [] },
+    { nodeId: '3', role: { value: 'Link' }, name: { value: 'More' }, childIds: [] },
+  ]);
+  assert.strictEqual(result.nodes.length, 3);
+  assert.strictEqual(result.nodes[0].role, 'unknown');
+  assert.strictEqual(result.nodes[2].role, 'link');
+  assert.strictEqual(result.refs['@e3'].name, 'More');
+});
+
+test('formatSnapshot renders indented lines and escapes quotes', () => {
+  const text = formatSnapshot([
+    { ref: '@e1', depth: 0, role: 'button', name: 'Save "Now"' },
+    { ref: '@e2', depth: 1, role: 'textbox', name: 'Search' },
+  ]);
+  assert.strictEqual(
+    text,
+    '@e1  [button] "Save \\"Now\\""\n  @e2  [textbox] "Search"'
+  );
+});
+
+test('formatSnapshot ignores invalid nodes and falls back to defaults', () => {
+  const text = formatSnapshot([null, { depth: -1, name: 'X' }]);
+  assert.strictEqual(text, '@e?  [unknown] "X"');
+});
+
+console.log('\nresolveRef:');
+test('resolveRef returns objectId + center coordinates', async () => {
+  const calls = [];
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {
+        '@e1': { backendDOMNodeId: 1234 },
+      },
+    },
+  };
+  const fakeSend = async (wsUrl, method, params) => {
+    calls.push({ wsUrl, method, params });
+    if (method === 'DOM.resolveNode') {
+      return { object: { objectId: 'obj-1' } };
+    }
+    if (method === 'DOM.getBoxModel') {
+      return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  };
+
+  const result = await resolveRef('ui', '@e1', {
+    getSession: (name) => fakeSession[name] || null,
+    cdpSend: fakeSend,
+  });
+  assert.deepStrictEqual(result, {
+    objectId: 'obj-1',
+    x: 20,
+    y: 30,
+    backendDOMNodeId: 1234,
+  });
+  assert.deepStrictEqual(
+    calls.map(call => call.method),
+    ['DOM.resolveNode', 'DOM.getBoxModel']
+  );
+});
+
+test('resolveRef throws when ref is missing from session refs', async () => {
+  const fakeSession = {
+    ui: {
+      pageWsUrl: 'ws://localhost:9222/devtools/page/1',
+      refs: {},
+    },
+  };
+  await assert.rejects(
+    resolveRef('ui', '@e9', {
+      getSession: (name) => fakeSession[name] || null,
+      cdpSend: async () => ({}),
+    }),
+    /Unknown ref/
+  );
+});
+
+console.log('\npress key mapping:');
+test('maps Enter to CDP key payload', () => {
+  assert.deepStrictEqual(parsePressKey('Enter'), { key: 'Enter', code: 'Enter' });
+});
+
+test('maps ArrowDown to CDP key payload', () => {
+  assert.deepStrictEqual(parsePressKey('ArrowDown'), { key: 'ArrowDown', code: 'ArrowDown' });
+});
+
+test('maps Space with text payload', () => {
+  assert.deepStrictEqual(parsePressKey('Space'), { key: ' ', code: 'Space', text: ' ' });
+});
+
+test('maps Ctrl+a with modifiers=2', () => {
+  assert.deepStrictEqual(parsePressKey('Ctrl+a'), { key: 'a', code: 'KeyA', modifiers: 2 });
+});
+
+test('returns null for unsupported key', () => {
+  assert.strictEqual(parsePressKey('Ctrl+F13'), null);
 });
 
 // ─── Interceptor utils (extracted pure functions) ───────────────
@@ -853,6 +1663,7 @@ test('parseArgs handles empty array', () => {
   const r = parseArgs([]);
   assert.deepStrictEqual(r.positional, []);
   assert.deepStrictEqual(r.flags, {});
+  assert.strictEqual(r.sessionName, DEFAULT_SESSION_NAME);
 });
 test('getCaptureKey normalizes method+url', () => {
   const k1 = getCaptureKey('GET', '/api/test', 'http://example.com');
@@ -868,5 +1679,9 @@ test('getSelector returns #id when present', () => {
   assert.strictEqual(getSelector(el), '#main');
 });
 
-console.log(`\n${pass} passed, ${fail} failed\n`);
-process.exit(fail > 0 ? 1 : 0);
+Promise.all(pendingTests)
+  .finally(() => {
+    resetSessionFile();
+    console.log(`\n${pass} passed, ${fail} failed\n`);
+    process.exit(fail > 0 ? 1 : 0);
+  });

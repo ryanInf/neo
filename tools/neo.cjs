@@ -18,6 +18,25 @@
 //   neo open <url>                          Open URL in Chrome
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
+//   neo launch <app> [--port N]             Launch Electron app with CDP enabled
+//   neo connect [port]                      Connect to Chrome/Electron CDP and save session
+//   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
+//   neo discover                            Discover reachable CDP targets on localhost ports
+//   neo sessions                            List saved active sessions
+//   neo tab                                 List CDP targets in the active session
+//   neo tab <index> | neo tab --url <pat>  Switch active tab target
+//   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
+//   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+//   neo click @ref [--new-tab]              Click element by @ref
+//   neo fill @ref "text"                     Clear then fill element by @ref
+//   neo type @ref "text"                     Type text without clearing
+//   neo press <key>                          Press keyboard key (supports Ctrl+a)
+//   neo hover @ref                           Hover over element by @ref
+//   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
+//   neo select @ref "value"                  Select option value by @ref
+//   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
+//   neo get text @ref | neo get url | neo get title  Extract page/element info
+//   neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -27,6 +46,7 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const { spawn, execSync } = require('child_process');
 
 const CDP_URL = process.env.NEO_CDP_URL || 'http://localhost:9222';
 const DB_NAME = 'neo-capture-v01';
@@ -34,6 +54,161 @@ const STORE_NAME = 'capturedRequests';
 const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || 'ikikhldfkbfmcbandaagjomhchlehjap';
 const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'clawd/skills/neo/schemas');
 const WORKFLOW_FILE_EXT = '.workflows.json';
+const SESSION_FILE = '/tmp/neo-sessions.json';
+const DEFAULT_SESSION_NAME = '__default__';
+const ELECTRON_APPS = Object.freeze({
+  slack: Object.freeze(['/usr/bin/slack', 'slack']),
+  code: Object.freeze(['/usr/bin/code', 'code']),
+  vscode: Object.freeze(['/usr/bin/code', 'code']),
+  discord: Object.freeze(['/usr/bin/discord', 'discord']),
+  notion: Object.freeze(['/usr/bin/notion', 'notion']),
+  figma: Object.freeze([]),
+  feishu: Object.freeze(['/opt/bytedance/feishu/feishu', 'feishu']),
+});
+const INTERACTIVE_ROLES = new Set([
+  'button', 'textbox', 'link', 'combobox', 'checkbox', 'menuitem', 'tab',
+  'radio', 'slider', 'switch', 'searchbox', 'spinbutton', 'option',
+  'treeitem', 'menuitemcheckbox', 'menuitemradio', 'listbox'
+]);
+
+function loadSessions() {
+  if (!fs.existsSync(SESSION_FILE)) return {};
+  try {
+    const raw = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  const safeSessions = (!sessions || typeof sessions !== 'object' || Array.isArray(sessions))
+    ? {}
+    : sessions;
+  fs.writeFileSync(SESSION_FILE, `${JSON.stringify(safeSessions, null, 2)}\n`, 'utf8');
+}
+
+function getSession(name = DEFAULT_SESSION_NAME) {
+  const sessions = loadSessions();
+  return sessions[name] || null;
+}
+
+function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
+  const sessions = loadSessions();
+  sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
+  saveSessions(sessions);
+  return sessions[name];
+}
+
+function shellEscape(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function commandExists(commandName) {
+  const name = String(commandName || '').trim();
+  if (!name || name.includes('/')) return false;
+  try {
+    execSync(`command -v ${shellEscape(name)}`, { stdio: 'ignore', shell: '/bin/sh' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeElectronAppName(appName) {
+  const normalized = String(appName || '').trim().toLowerCase();
+  if (normalized === 'vscode') return 'code';
+  return normalized;
+}
+
+function resolveElectronExecutable(appName, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const commandExistsFn = typeof deps.commandExists === 'function' ? deps.commandExists : commandExists;
+  const normalizedName = normalizeElectronAppName(appName);
+  if (!normalizedName || !Object.prototype.hasOwnProperty.call(ELECTRON_APPS, normalizedName)) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unknown-app',
+      candidates: [],
+    };
+  }
+  const candidates = Array.isArray(ELECTRON_APPS[normalizedName]) ? ELECTRON_APPS[normalizedName] : [];
+  if (!candidates.length) {
+    return {
+      app: normalizedName,
+      executable: null,
+      error: 'unsupported-on-linux',
+      candidates,
+    };
+  }
+  for (const candidate of candidates) {
+    if (candidate.includes('/')) {
+      if (existsSyncFn(candidate)) {
+        return { app: normalizedName, executable: candidate, error: null, candidates };
+      }
+      continue;
+    }
+    if (commandExistsFn(candidate)) {
+      return { app: normalizedName, executable: candidate, error: null, candidates };
+    }
+  }
+  return {
+    app: normalizedName,
+    executable: null,
+    error: 'executable-not-found',
+    candidates,
+  };
+}
+
+function extractRemoteDebugPort(text) {
+  const input = String(text || '');
+  const match = input.match(/--remote-debugging-port(?:=|\s+)(\d{1,5})/);
+  if (!match) return null;
+  const port = parseInt(match[1], 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+function findElectronDebugPort(appName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : execSync;
+  const normalized = String(appName || '').trim();
+  if (!normalized) return null;
+  const command = `ps aux | grep ${shellEscape(normalized)} | grep -- '--remote-debugging-port' | grep -v grep`;
+  try {
+    const output = String(execSyncFn(command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/sh',
+    }) || '');
+    return extractRemoteDebugPort(output);
+  } catch {
+    return null;
+  }
+}
+
+async function waitForCdpPort(port, timeoutMs = 10000, intervalMs = 250, deps = {}) {
+  const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
+  const sleepFn = typeof deps.sleep === 'function' ? deps.sleep : sleep;
+  const nowFn = typeof deps.now === 'function' ? deps.now : Date.now;
+  const target = `http://localhost:${port}/json/version`;
+  const deadline = nowFn() + timeoutMs;
+
+  while (nowFn() <= deadline) {
+    try {
+      const resp = await fetchFn(target);
+      if (resp && resp.ok) {
+        return true;
+      }
+    } catch {}
+    if (nowFn() >= deadline) break;
+    await sleepFn(intervalMs);
+  }
+  return false;
+}
 
 // ─── CDP Helpers ────────────────────────────────────────────────
 
@@ -55,6 +230,63 @@ async function findTab(pattern) {
   const pages = tabs.filter(t => t.type === 'page');
   if (!pages.length) throw new Error('No browser tabs found');
   return pages[0];
+}
+
+function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!pageWsUrl) {
+      reject(new Error('Missing page WebSocket URL'));
+      return;
+    }
+    if (!method) {
+      reject(new Error('Missing CDP method'));
+      return;
+    }
+
+    const ws = new WebSocket(pageWsUrl);
+    const id = 1;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error(`CDP timeout: ${method}`));
+    }, timeout);
+
+    function done(err, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    }
+
+    ws.on('open', () => {
+      const message = { id, method };
+      if (params && Object.keys(params).length > 0) {
+        message.params = params;
+      }
+      ws.send(JSON.stringify(message));
+    });
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); }
+      catch { return; }
+      if (msg.id !== id) return;
+      if (msg.error) {
+        done(new Error(`CDP ${method} failed: ${msg.error.message || 'Unknown error'}`));
+        return;
+      }
+      done(null, msg.result);
+    });
+
+    ws.on('error', (err) => done(err));
+    ws.on('close', () => {
+      if (!settled) done(new Error(`CDP socket closed before response: ${method}`));
+    });
+  });
 }
 
 function cdpEval(wsUrl, expression, timeout = 30000) {
@@ -86,6 +318,309 @@ function cdpEval(wsUrl, expression, timeout = 30000) {
   });
 }
 
+function axValueToString(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (typeof value === 'object' && value.value !== undefined && value.value !== null) {
+    return String(value.value);
+  }
+  return '';
+}
+
+function assignRefs(axTreeNodes) {
+  const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
+  const nodeById = new Map();
+  const childIds = new Set();
+
+  for (const node of sourceNodes) {
+    if (node.nodeId === undefined || node.nodeId === null) continue;
+    nodeById.set(String(node.nodeId), node);
+  }
+
+  for (const node of sourceNodes) {
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      childIds.add(String(childId));
+    }
+  }
+
+  const roots = sourceNodes.filter((node) => {
+    if (node.nodeId === undefined || node.nodeId === null) return true;
+    return !childIds.has(String(node.nodeId));
+  });
+
+  const visited = new Set();
+  const nodes = [];
+  const refs = {};
+  let nextRef = 1;
+
+  function visit(node, depth) {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    const ref = `@e${nextRef++}`;
+    const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
+    const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
+    const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
+    const bounds = node.bounds && typeof node.bounds === 'object' ? node.bounds : null;
+
+    nodes.push({ ref, depth, role, name, backendDOMNodeId, bounds });
+    refs[ref] = { backendDOMNodeId, role, name, bounds };
+
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      const childNode = nodeById.get(String(childId));
+      if (childNode) visit(childNode, depth + 1);
+    }
+  }
+
+  for (const root of roots) visit(root, 0);
+  for (const node of sourceNodes) {
+    if (!visited.has(node)) visit(node, 0);
+  }
+
+  return { nodes, refs };
+}
+
+function formatSnapshot(nodes) {
+  const rows = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node || typeof node !== 'object') continue;
+    const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
+    const indent = '  '.repeat(depth);
+    const ref = String(node.ref || '@e?');
+    const role = String(node.role || 'unknown');
+    const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
+    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+  }
+  return rows.join('\n');
+}
+
+function getSessionPageWsUrl(sessionName = DEFAULT_SESSION_NAME) {
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+  return session.pageWsUrl;
+}
+
+function getBackendNodeIdFromRef(session, ref) {
+  const normalizedRef = String(ref || '');
+  if (!normalizedRef.startsWith('@')) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
+    ? refs[normalizedRef].backendDOMNodeId
+    : null;
+  if (!backendDOMNodeId) {
+    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+  }
+  return backendDOMNodeId;
+}
+
+function centerFromQuad(quad) {
+  if (!Array.isArray(quad) || quad.length < 8) return null;
+  const xs = [quad[0], quad[2], quad[4], quad[6]].map(Number).filter(Number.isFinite);
+  const ys = [quad[1], quad[3], quad[5], quad[7]].map(Number).filter(Number.isFinite);
+  if (xs.length !== 4 || ys.length !== 4) return null;
+  const x = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+  const y = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+  return { x, y };
+}
+
+async function resolveRef(sessionName, ref, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : cdpSend;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || !session.pageWsUrl) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const backendDOMNodeId = getBackendNodeIdFromRef(session, ref);
+  const resolved = await sendFn(session.pageWsUrl, 'DOM.resolveNode', { backendNodeId: backendDOMNodeId });
+  const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (!objectId) {
+    throw new Error(`Failed to resolve node for ${ref}`);
+  }
+
+  const boxModel = await sendFn(session.pageWsUrl, 'DOM.getBoxModel', { objectId });
+  const quad = boxModel && boxModel.model && boxModel.model.content;
+  const center = centerFromQuad(quad);
+  if (!center) {
+    throw new Error(`Failed to get box model for ${ref}`);
+  }
+
+  return {
+    objectId,
+    x: center.x,
+    y: center.y,
+    backendDOMNodeId,
+  };
+}
+
+const PRESS_KEY_MAP = {
+  enter: { key: 'Enter', code: 'Enter' },
+  tab: { key: 'Tab', code: 'Tab' },
+  escape: { key: 'Escape', code: 'Escape' },
+  esc: { key: 'Escape', code: 'Escape' },
+  backspace: { key: 'Backspace', code: 'Backspace' },
+  arrowup: { key: 'ArrowUp', code: 'ArrowUp' },
+  arrowdown: { key: 'ArrowDown', code: 'ArrowDown' },
+  arrowleft: { key: 'ArrowLeft', code: 'ArrowLeft' },
+  arrowright: { key: 'ArrowRight', code: 'ArrowRight' },
+  space: { key: ' ', code: 'Space', text: ' ' },
+  delete: { key: 'Delete', code: 'Delete' },
+  home: { key: 'Home', code: 'Home' },
+  end: { key: 'End', code: 'End' },
+  pageup: { key: 'PageUp', code: 'PageUp' },
+  pagedown: { key: 'PageDown', code: 'PageDown' },
+};
+
+function parsePressKey(rawKey) {
+  const input = String(rawKey || '').trim();
+  if (!input) return null;
+
+  const parts = input.split('+').map(part => part.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  const keyPart = parts.pop();
+  const lowerKey = String(keyPart || '').toLowerCase();
+  let mapped = PRESS_KEY_MAP[lowerKey] ? { ...PRESS_KEY_MAP[lowerKey] } : null;
+
+  if (!mapped && /^[a-z]$/i.test(keyPart)) {
+    const char = keyPart.toLowerCase();
+    mapped = { key: char, code: `Key${char.toUpperCase()}` };
+  }
+
+  if (!mapped) return null;
+
+  let modifiers = 0;
+  for (const token of parts) {
+    const lower = token.toLowerCase();
+    if (lower === 'ctrl' || lower === 'control') {
+      modifiers |= 2;
+      continue;
+    }
+    if (lower === 'alt') {
+      modifiers |= 1;
+      continue;
+    }
+    if (lower === 'meta' || lower === 'cmd' || lower === 'command') {
+      modifiers |= 4;
+      continue;
+    }
+    if (lower === 'shift') {
+      modifiers |= 8;
+      continue;
+    }
+    return null;
+  }
+
+  if (modifiers) mapped.modifiers = modifiers;
+  return mapped;
+}
+
+async function resolveScrollPoint(pageWsUrl, selector) {
+  const expression = `(function() {
+    try {
+      var el = ${selector ? `document.querySelector(${JSON.stringify(selector)})` : 'null'};
+      if (el) {
+        var rect = el.getBoundingClientRect();
+        return {
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2)
+        };
+      }
+    } catch (e) {}
+    return {
+      x: Math.round(window.innerWidth / 2),
+      y: Math.round(window.innerHeight / 2)
+    };
+  })()`;
+  const result = await cdpSend(pageWsUrl, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  });
+  const value = result && result.result && result.result.value;
+  if (!value || !Number.isFinite(value.x) || !Number.isFinite(value.y)) {
+    return { x: 0, y: 0 };
+  }
+  return {
+    x: Number(value.x),
+    y: Number(value.y),
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function selectorFromObject(pageWsUrl, objectId) {
+  const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+    objectId,
+    functionDeclaration: `function() {
+      function fallbackEscape(value) {
+        return String(value || '').replace(/[^a-zA-Z0-9_\\-]/g, '\\\\$&');
+      }
+      function esc(value) {
+        if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(value);
+        return fallbackEscape(value);
+      }
+      if (!this || this.nodeType !== 1) return '';
+      if (this.id) return '#' + esc(this.id);
+      var parts = [];
+      var node = this;
+      while (node && node.nodeType === 1 && parts.length < 8) {
+        var part = node.nodeName.toLowerCase();
+        if (node.classList && node.classList.length > 0) {
+          part += '.' + Array.from(node.classList).slice(0, 2).map(esc).join('.');
+        }
+        var parent = node.parentElement;
+        if (parent) {
+          var siblings = Array.from(parent.children).filter(function(child) {
+            return child.nodeName === node.nodeName;
+          });
+          if (siblings.length > 1) {
+            part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+          }
+        }
+        parts.unshift(part);
+        if (node.id) break;
+        node = parent;
+      }
+      return parts.join(' > ');
+    }`,
+    returnByValue: true,
+  });
+  const selector = result && result.result ? result.result.value : '';
+  return typeof selector === 'string' ? selector.trim() : '';
+}
+
+async function waitForSelector(pageWsUrl, selector, timeoutMs = 10000, intervalMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const doc = await cdpSend(pageWsUrl, 'DOM.getDocument', { depth: 1, pierce: true });
+    const rootNodeId = doc && doc.root && doc.root.nodeId;
+    if (Number.isInteger(rootNodeId)) {
+      const found = await cdpSend(pageWsUrl, 'DOM.querySelector', {
+        nodeId: rootNodeId,
+        selector,
+      });
+      if (found && Number.isInteger(found.nodeId) && found.nodeId > 0) {
+        return true;
+      }
+    }
+    if (Date.now() + intervalMs > deadline) break;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
 function dbEval(body) {
   return `new Promise(function(resolve) {
     var req = indexedDB.open("${DB_NAME}");
@@ -98,6 +633,20 @@ function dbEval(body) {
     req.onerror = function() { resolve("Error: " + req.error); };
     setTimeout(function() { resolve("timeout"); }, 10000);
   })`;
+}
+
+async function fetchJsonOrThrow(url, timeoutMs = 3000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const AUTH_HEADER_PATTERNS = [
@@ -1053,20 +1602,232 @@ function loadDependencyData(wsUrl, domain) {
 
 // ─── CLI Parsing ────────────────────────────────────────────────
 
+function parseSnapshotArgs(argv) {
+  const options = {
+    interactiveOnly: false,
+    includeCursorPointer: false,
+    json: false,
+    selector: null,
+  };
+  const unknown = [];
+
+  const args = Array.isArray(argv) ? argv : [];
+  for (let i = 0; i < args.length; i++) {
+    const current = args[i];
+    if (current === '-i') {
+      options.interactiveOnly = true;
+      continue;
+    }
+    if (current === '-C') {
+      options.includeCursorPointer = true;
+      continue;
+    }
+    if (current === '--json') {
+      options.json = true;
+      continue;
+    }
+    if (current === '--selector') {
+      if (args[i + 1] && !args[i + 1].startsWith('-')) {
+        options.selector = args[i + 1];
+        i++;
+      } else {
+        unknown.push(current);
+      }
+      continue;
+    }
+    if (current.startsWith('--selector=')) {
+      options.selector = current.slice('--selector='.length);
+      continue;
+    }
+    unknown.push(current);
+  }
+
+  return { options, unknown };
+}
+
 function parseArgs(argv) {
   const positional = [];
   const flags = {};
+  let sessionName = DEFAULT_SESSION_NAME;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
+    const current = argv[i];
+    if (current.startsWith('--')) {
+      const eqIndex = current.indexOf('=');
+      const hasInlineValue = eqIndex > 2;
+      const key = hasInlineValue ? current.slice(2, eqIndex) : current.slice(2);
+      const inlineValue = hasInlineValue ? current.slice(eqIndex + 1) : null;
       const next = argv[i + 1];
-      if (next && !next.startsWith('--')) { flags[key] = next; i++; }
-      else { flags[key] = true; }
+      if (key === 'session') {
+        if (hasInlineValue) {
+          sessionName = inlineValue || DEFAULT_SESSION_NAME;
+        } else if (next && !next.startsWith('--')) {
+          sessionName = next;
+          i++;
+        } else {
+          sessionName = DEFAULT_SESSION_NAME;
+        }
+        continue;
+      }
+      if (hasInlineValue) {
+        flags[key] = inlineValue;
+      } else if (next && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
     } else {
-      positional.push(argv[i]);
+      positional.push(current);
     }
   }
-  return { positional, flags };
+  return { positional, flags, sessionName };
+}
+
+function stripGlobalSessionFlag(argv) {
+  const clean = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--session') {
+      if (argv[i + 1] && !argv[i + 1].startsWith('--')) i++;
+      continue;
+    }
+    if (arg.startsWith('--session=')) continue;
+    clean.push(arg);
+  }
+  return clean;
+}
+
+async function connectToCdpPort(port, sessionName = DEFAULT_SESSION_NAME) {
+  const cdpUrl = `http://localhost:${port}`;
+  const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
+  const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
+  const page = targets.find(target => target.type === 'page');
+  if (!page) {
+    throw new Error(`Connected to ${cdpUrl} but no page target found`);
+  }
+
+  const tabId = page.id || page.targetId || '';
+  setSession(sessionName, {
+    cdpUrl,
+    pageWsUrl: page.webSocketDebuggerUrl || '',
+    tabId,
+    refs: {},
+  });
+
+  return {
+    cdpUrl,
+    versionInfo,
+    tabId,
+    page,
+  };
+}
+
+function parseTabTargets(targets) {
+  const source = Array.isArray(targets) ? targets : [];
+  return source.map((target, index) => {
+    const item = target && typeof target === 'object' ? target : {};
+    const id = item.id || item.targetId || '';
+    return {
+      index,
+      type: String(item.type || 'unknown'),
+      id: String(id || ''),
+      title: String(item.title || ''),
+      url: String(item.url || ''),
+      webSocketDebuggerUrl: String(item.webSocketDebuggerUrl || ''),
+    };
+  });
+}
+
+function getSessionCdpUrl(sessionName = DEFAULT_SESSION_NAME) {
+  const session = getSession(sessionName);
+  if (session && session.cdpUrl) return session.cdpUrl;
+  return CDP_URL;
+}
+
+function updateSessionTab(sessionName, cdpUrl, target) {
+  const existing = getSession(sessionName) || {};
+  setSession(sessionName, {
+    ...existing,
+    cdpUrl,
+    pageWsUrl: target.webSocketDebuggerUrl,
+    tabId: target.id,
+    refs: {},
+  });
+}
+
+async function listSessionTargets(sessionName = DEFAULT_SESSION_NAME) {
+  const cdpUrl = getSessionCdpUrl(sessionName);
+  const targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  return { cdpUrl, targets };
+}
+
+function findTabTargetByUrlPattern(targets, pattern) {
+  const list = Array.isArray(targets) ? targets : [];
+  const input = String(pattern || '');
+  if (!input) return null;
+  return list.find(target => target.url.includes(input)) || null;
+}
+
+function activateSessionTarget(sessionName, cdpUrl, target) {
+  if (!target || !target.webSocketDebuggerUrl) {
+    throw new Error(`Target ${target && (target.id || target.index)} does not expose webSocketDebuggerUrl`);
+  }
+  updateSessionTab(sessionName, cdpUrl, target);
+  return target;
+}
+
+async function switchSessionTabByUrl(sessionName, pattern) {
+  const { cdpUrl, targets } = await listSessionTargets(sessionName);
+  const selected = findTabTargetByUrlPattern(targets, pattern);
+  if (!selected) {
+    throw new Error(`No tab matching URL pattern: ${pattern}`);
+  }
+  return activateSessionTarget(sessionName, cdpUrl, selected);
+}
+
+function loadInjectScriptSource(deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : fs.readFileSync;
+  const rootDir = deps.rootDir || path.join(fs.realpathSync(__dirname), '..');
+  const primary = path.join(rootDir, 'extension', 'inject.js');
+  const fallback = path.join(rootDir, 'extension-dist', 'content.js');
+
+  if (existsSyncFn(primary)) {
+    return { sourcePath: primary, source: readFileSyncFn(primary, 'utf8') };
+  }
+  if (existsSyncFn(fallback)) {
+    return { sourcePath: fallback, source: readFileSyncFn(fallback, 'utf8') };
+  }
+  throw new Error(`Inject script not found. Tried: ${primary} and ${fallback}`);
+}
+
+function buildInjectScript(sourceCode) {
+  const raw = String(sourceCode || '');
+  return `(function() {
+  try {
+    if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
+      globalThis.__NEO_CAPTURES__ = [];
+    }
+    if (typeof globalThis.__neoMiniReporter !== 'function') {
+      globalThis.__neoMiniReporter = function(event, payload) {
+        try {
+          console.debug('[neo:inject]', event, payload || {});
+        } catch {}
+      };
+    }
+    globalThis.__neoMiniReporter('inject:start', { captures: globalThis.__NEO_CAPTURES__.length });
+    (function() {
+${raw}
+    }).call(globalThis);
+    globalThis.__neoMiniReporter('inject:ready', { captures: globalThis.__NEO_CAPTURES__.length });
+    return { ok: true, captures: globalThis.__NEO_CAPTURES__.length };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  }
+})();`;
 }
 
 // ─── Commands ───────────────────────────────────────────────────
@@ -1077,6 +1838,659 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+// neo launch <app> [--port N]
+commands.launch = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  const rawApp = positional[0];
+  const rawPort = flags.port === undefined ? '9222' : String(flags.port);
+  const port = parseInt(rawPort, 10);
+  if (!rawApp || positional.length > 1 || flags.port === true || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    console.error('Usage: neo launch <app> [--port N]');
+    process.exit(1);
+  }
+
+  const resolved = resolveElectronExecutable(rawApp);
+  if (resolved.error === 'unknown-app') {
+    console.error(`Unknown app: ${rawApp}`);
+    console.error(`Supported apps: ${Object.keys(ELECTRON_APPS).join(', ')}`);
+    process.exit(1);
+  }
+  if (resolved.error === 'unsupported-on-linux') {
+    console.error(`${normalizeElectronAppName(rawApp)}: no native Linux client`);
+    process.exit(1);
+  }
+  if (!resolved.executable) {
+    console.error(`Cannot find executable for ${normalizeElectronAppName(rawApp)}.`);
+    console.error(`Tried: ${resolved.candidates.join(', ')}`);
+    process.exit(1);
+  }
+
+  const spawnArgs = [`--remote-debugging-port=${port}`];
+  const child = spawn(resolved.executable, spawnArgs, {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const ready = await waitForCdpPort(port, 10000, 250);
+  if (!ready) {
+    throw new Error(`Launched ${normalizeElectronAppName(rawApp)} but CDP endpoint on port ${port} was not ready within 10s`);
+  }
+
+  console.log(`Launched ${normalizeElectronAppName(rawApp)} on port ${port}`);
+};
+
+// neo connect [port]
+commands.connect = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const electronApp = flags.electron ? String(flags.electron) : null;
+  let rawPort = positional[0];
+  if (electronApp) {
+    if (flags.electron === true || positional.length > 0) {
+      console.error('Usage: neo connect [port] | neo connect --electron <app-name>');
+      process.exit(1);
+    }
+    const discoveredPort = findElectronDebugPort(electronApp);
+    if (!discoveredPort) {
+      throw new Error(`No running Electron app "${electronApp}" with --remote-debugging-port found. Run: neo launch ${normalizeElectronAppName(electronApp)}`);
+    }
+    rawPort = String(discoveredPort);
+  }
+
+  const port = rawPort ? parseInt(rawPort, 10) : 9222;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    console.error(`Invalid port: ${rawPort}`);
+    console.error('Usage: neo connect [port] | neo connect --electron <app-name>');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const connected = await connectToCdpPort(port, sessionName);
+
+  console.log(`Connected: ${connected.versionInfo.Browser || 'CDP'} @ ${connected.cdpUrl}`);
+  console.log(`Session: ${sessionName}`);
+  console.log(`Tab: ${connected.tabId || '(no-id)'} ${connected.page.title ? `- ${connected.page.title}` : ''}`);
+};
+
+// neo discover
+commands.discover = async function() {
+  const startPort = 9222;
+  const endPort = 9299;
+  const ports = [];
+  for (let port = startPort; port <= endPort; port++) ports.push(port);
+
+  const discovered = await Promise.all(ports.map(async (port) => {
+    const cdpUrl = `http://localhost:${port}`;
+    try {
+      const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`, 800);
+      const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`, 800);
+      const pages = Array.isArray(targets) ? targets.filter(target => target.type === 'page') : [];
+      return { port, cdpUrl, versionInfo, pages };
+    } catch {
+      return null;
+    }
+  }));
+
+  const available = discovered.filter(Boolean);
+  if (!available.length) {
+    console.log('No CDP endpoints found on localhost ports 9222-9299');
+    return;
+  }
+
+  for (const item of available) {
+    const browser = item.versionInfo?.Browser || 'Unknown Browser';
+    console.log(`[${item.port}] ${browser}`);
+    if (!item.pages.length) {
+      console.log('  (no page targets)');
+      continue;
+    }
+    for (const page of item.pages) {
+      const tabId = page.id || page.targetId || '(no-id)';
+      const title = page.title || '(untitled)';
+      console.log(`  ${tabId} ${title}`);
+      console.log(`    ${page.url || '(no-url)'}`);
+    }
+  }
+};
+
+// neo sessions
+commands.sessions = function() {
+  const sessions = loadSessions();
+  const active = Object.entries(sessions)
+    .filter(([, value]) => value && typeof value === 'object' && value.cdpUrl);
+
+  if (!active.length) {
+    console.log('No active sessions');
+    return;
+  }
+
+  active.sort(([nameA], [nameB]) => {
+    if (nameA === DEFAULT_SESSION_NAME && nameB !== DEFAULT_SESSION_NAME) return -1;
+    if (nameB === DEFAULT_SESSION_NAME && nameA !== DEFAULT_SESSION_NAME) return 1;
+    return nameA.localeCompare(nameB);
+  });
+
+  for (const [name, data] of active) {
+    const tab = data.tabId || '(no-tab)';
+    console.log(`${name} ${data.cdpUrl} ${tab}`);
+  }
+};
+
+// neo tab / neo tab <index> / neo tab --url <pattern>
+commands.tab = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const { cdpUrl, targets } = await listSessionTargets(sessionName);
+  if (!targets.length) {
+    console.log('No CDP targets found');
+    return;
+  }
+
+  const urlPattern = flags.url === undefined ? null : flags.url;
+  if (urlPattern === true || positional.length > 1 || (urlPattern !== null && positional.length > 0)) {
+    console.error('Usage: neo tab | neo tab <index> | neo tab --url <pattern>');
+    process.exit(1);
+  }
+
+  if (urlPattern === null && positional.length === 0) {
+    for (const target of targets) {
+      const title = target.title || '(untitled)';
+      const id = target.id || '(no-id)';
+      console.log(`[${target.index}] ${target.type} ${id} ${title}`);
+      console.log(`    ${target.url || '(no-url)'}`);
+    }
+    return;
+  }
+
+  let selected = null;
+  if (urlPattern !== null) {
+    selected = findTabTargetByUrlPattern(targets, String(urlPattern));
+    if (!selected) {
+      throw new Error(`No tab matching URL pattern: ${String(urlPattern)}`);
+    }
+  } else {
+    const index = parseInt(String(positional[0]), 10);
+    if (!Number.isInteger(index) || index < 0 || index >= targets.length) {
+      throw new Error(`Invalid tab index: ${positional[0]}`);
+    }
+    selected = targets[index];
+  }
+
+  activateSessionTarget(sessionName, cdpUrl, selected);
+  console.log(`Switched to tab ${selected.index}: ${selected.id || '(no-id)'} ${selected.title || '(untitled)'}`);
+};
+
+// neo inject [--persist] [--tab pattern]
+commands.inject = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 0 || flags.tab === true) {
+    console.error('Usage: neo inject [--persist] [--tab pattern]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  if (flags.tab !== undefined) {
+    await switchSessionTabByUrl(sessionName, String(flags.tab));
+  }
+
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    console.error('Run neo connect [port] first');
+    process.exit(1);
+  }
+
+  const loaded = loadInjectScriptSource();
+  const script = buildInjectScript(loaded.source);
+  const evaluated = await cdpSend(session.pageWsUrl, 'Runtime.evaluate', {
+    expression: script,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (evaluated && evaluated.exceptionDetails) {
+    throw new Error('Inject evaluate failed');
+  }
+
+  const payload = evaluated && evaluated.result ? evaluated.result.value : null;
+  if (!payload || payload.ok !== true) {
+    throw new Error(payload && payload.error ? payload.error : 'Inject script failed');
+  }
+
+  if (flags.persist !== undefined) {
+    await cdpSend(session.pageWsUrl, 'Page.addScriptToEvaluateOnNewDocument', {
+      source: script,
+    });
+  }
+
+  const persisted = flags.persist !== undefined ? ' (persist)' : '';
+  console.log(`Injected Neo capture script${persisted}`);
+};
+
+// neo snapshot [-i] [-C] [--json] [--selector css]
+commands.snapshot = async function(args, context = {}) {
+  const { options, unknown } = parseSnapshotArgs(args || []);
+  if (unknown.length > 0) {
+    console.error('Usage: neo snapshot [-i] [-C] [--json] [--selector css]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    console.error('Run neo connect [port] first');
+    process.exit(1);
+  }
+
+  await cdpSend(session.pageWsUrl, 'Accessibility.enable');
+  const treeResult = await cdpSend(session.pageWsUrl, 'Accessibility.getFullAXTree');
+  const assigned = assignRefs(treeResult && Array.isArray(treeResult.nodes) ? treeResult.nodes : []);
+
+  const displayNodes = options.interactiveOnly
+    ? assigned.nodes.filter(node => INTERACTIVE_ROLES.has(String(node.role || '').toLowerCase()))
+    : assigned.nodes;
+
+  setSession(sessionName, {
+    ...session,
+    refs: assigned.refs,
+  });
+
+  if (options.includeCursorPointer) {
+    // TODO: Add Runtime.evaluate scan for cursor:pointer elements.
+    console.error('TODO: snapshot -C (cursor:pointer) is not implemented yet');
+  }
+  if (options.selector) {
+    // TODO: Add CSS selector scoped snapshot filtering.
+    console.error('TODO: snapshot --selector is not implemented yet');
+  }
+
+  if (options.json) {
+    const refs = {};
+    for (const node of displayNodes) {
+      if (node && node.ref && assigned.refs[node.ref]) {
+        refs[node.ref] = assigned.refs[node.ref];
+      }
+    }
+    console.log(JSON.stringify({
+      session: sessionName,
+      count: displayNodes.length,
+      nodes: displayNodes,
+      refs,
+    }, null, 2));
+    return;
+  }
+
+  const output = formatSnapshot(displayNodes);
+  console.log(output || '(empty snapshot)');
+};
+
+// neo click @ref [--new-tab]
+commands.click = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const ref = positional[0];
+  if (!ref || positional.length > 1) {
+    console.error('Usage: neo click @ref [--new-tab]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  const modifiers = flags['new-tab'] !== undefined ? 4 : 0;
+  const base = {
+    x: target.x,
+    y: target.y,
+    button: 'left',
+    clickCount: 1,
+  };
+  if (modifiers) base.modifiers = modifiers;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    ...base,
+    type: 'mousePressed',
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    ...base,
+    type: 'mouseReleased',
+  });
+  console.log(`Clicked ${ref}`);
+};
+
+// neo fill @ref "text"
+commands.fill = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || text === null) {
+    console.error('Usage: neo fill @ref "text"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+
+  await cdpSend(pageWsUrl, 'DOM.focus', {
+    backendNodeId: target.backendDOMNodeId,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'a',
+    code: 'KeyA',
+    modifiers: 2,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'a',
+    code: 'KeyA',
+    modifiers: 2,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'Backspace',
+    code: 'Backspace',
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'Backspace',
+    code: 'Backspace',
+  });
+  await cdpSend(pageWsUrl, 'Input.insertText', { text });
+  console.log(`Filled ${ref}`);
+};
+
+// neo type @ref "text"
+commands.type = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || text === null) {
+    console.error('Usage: neo type @ref "text"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  await cdpSend(pageWsUrl, 'DOM.focus', {
+    backendNodeId: target.backendDOMNodeId,
+  });
+  await cdpSend(pageWsUrl, 'Input.insertText', { text });
+  console.log(`Typed into ${ref}`);
+};
+
+// neo press <key>
+commands.press = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const rawKey = positional[0];
+  if (!rawKey || positional.length > 1) {
+    console.error('Usage: neo press <key>');
+    process.exit(1);
+  }
+
+  const mapped = parsePressKey(rawKey);
+  if (!mapped) {
+    console.error(`Unsupported key: ${rawKey}`);
+    console.error('Supported: Enter, Tab, Escape, Backspace, ArrowUp/Down/Left/Right, Space, Delete, Home, End, PageUp, PageDown, Ctrl+a');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const down = {
+    type: 'keyDown',
+    key: mapped.key,
+    code: mapped.code,
+  };
+  if (mapped.modifiers) down.modifiers = mapped.modifiers;
+  if (mapped.text !== undefined) down.text = mapped.text;
+
+  const up = {
+    type: 'keyUp',
+    key: mapped.key,
+    code: mapped.code,
+  };
+  if (mapped.modifiers) up.modifiers = mapped.modifiers;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', down);
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', up);
+  console.log(`Pressed ${rawKey}`);
+};
+
+// neo hover @ref
+commands.hover = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  if (!ref || positional.length > 1) {
+    console.error('Usage: neo hover @ref');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x: target.x,
+    y: target.y,
+  });
+  console.log(`Hovered ${ref}`);
+};
+
+// neo scroll <up|down|left|right> [px] [--selector css]
+commands.scroll = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const direction = String(positional[0] || '').toLowerCase();
+  const rawDistance = positional[1];
+  const distance = rawDistance ? parseInt(rawDistance, 10) : 300;
+  const selector = flags.selector || null;
+  if (flags.selector === true || !direction || !['up', 'down', 'left', 'right'].includes(direction) || (rawDistance && (!Number.isInteger(distance) || distance <= 0))) {
+    console.error('Usage: neo scroll <up|down|left|right> [px] [--selector css]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const point = await resolveScrollPoint(pageWsUrl, selector);
+  const wheel = {
+    type: 'mouseWheel',
+    x: point.x,
+    y: point.y,
+    deltaX: 0,
+    deltaY: 0,
+  };
+  if (direction === 'up') wheel.deltaY = -distance;
+  if (direction === 'down') wheel.deltaY = distance;
+  if (direction === 'left') wheel.deltaX = -distance;
+  if (direction === 'right') wheel.deltaX = distance;
+
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', wheel);
+  console.log(`Scrolled ${direction} ${distance}px`);
+};
+
+// neo select @ref "value"
+commands.select = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const value = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || value === null) {
+    console.error('Usage: neo select @ref "value"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+    objectId: target.objectId,
+    functionDeclaration: `function(nextValue) {
+      if (!this) return { ok: false, error: 'missing element' };
+      if (!('value' in this)) return { ok: false, error: 'element has no value property' };
+      if (typeof this.focus === 'function') this.focus();
+      this.value = nextValue;
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, value: this.value };
+    }`,
+    arguments: [{ value }],
+    returnByValue: true,
+  });
+
+  if (result && result.exceptionDetails) {
+    throw new Error(`Failed to select value for ${ref}`);
+  }
+  const payload = result && result.result && result.result.value;
+  if (!payload || payload.ok !== true) {
+    throw new Error(payload && payload.error ? payload.error : `Failed to select value for ${ref}`);
+  }
+
+  console.log(`Selected ${ref} = "${payload.value}"`);
+};
+
+// neo screenshot [path] [--full] [--annotate]
+commands.screenshot = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 1) {
+    console.error('Usage: neo screenshot [path] [--full] [--annotate]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const outputPath = positional[0]
+    ? path.resolve(positional[0])
+    : `/tmp/neo-screenshot-${Date.now()}.png`;
+  const screenshotParams = {
+    format: 'png',
+  };
+
+  if (flags.full !== undefined) {
+    const layout = await cdpSend(pageWsUrl, 'Page.getLayoutMetrics');
+    const contentSize = (layout && layout.contentSize) || (layout && layout.cssContentSize) || null;
+    if (contentSize && Number.isFinite(contentSize.width) && Number.isFinite(contentSize.height)) {
+      screenshotParams.captureBeyondViewport = true;
+      screenshotParams.clip = {
+        x: 0,
+        y: 0,
+        width: Math.max(1, Math.ceil(contentSize.width)),
+        height: Math.max(1, Math.ceil(contentSize.height)),
+        scale: 1,
+      };
+    } else {
+      screenshotParams.captureBeyondViewport = true;
+    }
+  }
+
+  const result = await cdpSend(pageWsUrl, 'Page.captureScreenshot', screenshotParams);
+  if (!result || !result.data) {
+    throw new Error('Failed to capture screenshot');
+  }
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, Buffer.from(result.data, 'base64'));
+  if (flags.annotate !== undefined) {
+    console.error('TODO: screenshot --annotate is not implemented yet');
+  }
+  console.log(outputPath);
+};
+
+// neo get text @ref | neo get url | neo get title
+commands.get = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const subject = positional[0];
+  if (!subject) {
+    console.error('Usage: neo get text @ref | neo get url | neo get title');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+
+  if (subject === 'text') {
+    const ref = positional[1];
+    if (!ref || positional.length > 2) {
+      console.error('Usage: neo get text @ref');
+      process.exit(1);
+    }
+    const target = await resolveRef(sessionName, ref);
+    const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+      objectId: target.objectId,
+      functionDeclaration: `function() {
+        if (!this) return '';
+        if (typeof this.innerText === 'string') return this.innerText;
+        if (typeof this.textContent === 'string') return this.textContent;
+        return '';
+      }`,
+      returnByValue: true,
+    });
+    const text = result && result.result ? result.result.value : '';
+    console.log(text === undefined || text === null ? '' : String(text));
+    return;
+  }
+
+  if (subject === 'url' || subject === 'title') {
+    if (positional.length > 1) {
+      console.error(`Usage: neo get ${subject}`);
+      process.exit(1);
+    }
+    const expression = subject === 'url' ? 'location.href' : 'document.title';
+    const result = await cdpSend(pageWsUrl, 'Runtime.evaluate', {
+      expression,
+      returnByValue: true,
+    });
+    const value = result && result.result ? result.result.value : '';
+    console.log(value === undefined || value === null ? '' : String(value));
+    return;
+  }
+
+  console.error('Usage: neo get text @ref | neo get url | neo get title');
+  process.exit(1);
+};
+
+// neo wait @ref | neo wait --load networkidle | neo wait <ms>
+commands.wait = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+
+  if (flags.load !== undefined) {
+    if (String(flags.load || '').toLowerCase() !== 'networkidle') {
+      console.error('Usage: neo wait --load networkidle');
+      process.exit(1);
+    }
+    await sleep(2000);
+    console.log('Waited for networkidle (2000ms)');
+    return;
+  }
+
+  const target = positional[0];
+  if (!target || positional.length > 1) {
+    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    process.exit(1);
+  }
+
+  if (target.startsWith('@')) {
+    const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+    const pageWsUrl = getSessionPageWsUrl(sessionName);
+    const resolved = await resolveRef(sessionName, target);
+    const selector = await selectorFromObject(pageWsUrl, resolved.objectId);
+    if (!selector) {
+      throw new Error(`Failed to derive selector for ${target}`);
+    }
+    const ok = await waitForSelector(pageWsUrl, selector, 10000, 500);
+    if (!ok) {
+      console.error(`Timeout waiting for ${target}`);
+      process.exit(1);
+    }
+    console.log(`Found ${target}`);
+    return;
+  }
+
+  const ms = parseInt(target, 10);
+  if (!Number.isInteger(ms) || ms < 0) {
+    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    process.exit(1);
+  }
+  await sleep(ms);
+  console.log(`Waited ${ms}ms`);
 };
 
 // neo label <domain> [--dry-run]
@@ -3596,10 +5010,14 @@ commands.doctor = async function() {
 };
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  const rawArgv = process.argv.slice(2);
+  const parsed = parseArgs(rawArgv);
+  const sessionName = parsed.sessionName || DEFAULT_SESSION_NAME;
+  const cleanArgv = stripGlobalSessionFlag(rawArgv);
+  const [cmd, ...args] = cleanArgv;
 
   if (commands[cmd]) {
-    await commands[cmd](args);
+    await commands[cmd](args, { sessionName });
   } else {
     console.log(`Neo — Turn any web app into an API
 
@@ -3613,6 +5031,25 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo launch <app> [--port N]             Launch Electron app with CDP enabled
+  neo connect [port]                      Connect to CDP and save active session
+  neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
+  neo discover                            Discover reachable CDP endpoints on localhost
+  neo sessions                            List saved active sessions
+  neo tab                                 List CDP targets in the active session
+  neo tab <index> | neo tab --url <pat>  Switch active tab target
+  neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
+  neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+  neo click @ref [--new-tab]              Click element by @ref
+  neo fill @ref "text"                     Clear then fill element by @ref
+  neo type @ref "text"                     Type text without clearing
+  neo press <key>                          Press keyboard key (supports Ctrl+a)
+  neo hover @ref                           Hover over element by @ref
+  neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
+  neo select @ref "value"                  Select option value by @ref
+  neo screenshot [path] [--full] [--annotate] Capture screenshot to file
+  neo get text @ref | neo get url | neo get title  Extract page/element info
+  neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
@@ -3632,6 +5069,7 @@ Options (for exec):
   --body '{"key": "value"}'              Request body
   --tab <pattern>                         Match tab by URL pattern
   --auto-headers                          Auto-detect auth headers from live browser traffic
+  --session <name>                        Global session name (default: __default__)
 
 Environment:
   NEO_CDP_URL        Chrome DevTools URL (default: http://localhost:9222)
