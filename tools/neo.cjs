@@ -19,6 +19,7 @@
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
+//   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -135,12 +136,18 @@ function dbEval(body) {
   })`;
 }
 
-async function fetchJsonOrThrow(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`);
+async function fetchJsonOrThrow(url, timeoutMs = 3000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return response.json();
 }
 
 const AUTH_HEADER_PATTERNS = [
@@ -1153,6 +1160,47 @@ commands.connect = async function(args, context = {}) {
   console.log(`Connected: ${versionInfo.Browser || 'CDP'} @ ${cdpUrl}`);
   console.log(`Session: ${sessionName}`);
   console.log(`Tab: ${tabId || '(no-id)'} ${page.title ? `- ${page.title}` : ''}`);
+};
+
+// neo discover
+commands.discover = async function() {
+  const startPort = 9222;
+  const endPort = 9299;
+  const ports = [];
+  for (let port = startPort; port <= endPort; port++) ports.push(port);
+
+  const discovered = await Promise.all(ports.map(async (port) => {
+    const cdpUrl = `http://localhost:${port}`;
+    try {
+      const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`, 800);
+      const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`, 800);
+      const pages = Array.isArray(targets) ? targets.filter(target => target.type === 'page') : [];
+      return { port, cdpUrl, versionInfo, pages };
+    } catch {
+      return null;
+    }
+  }));
+
+  const available = discovered.filter(Boolean);
+  if (!available.length) {
+    console.log('No CDP endpoints found on localhost ports 9222-9299');
+    return;
+  }
+
+  for (const item of available) {
+    const browser = item.versionInfo?.Browser || 'Unknown Browser';
+    console.log(`[${item.port}] ${browser}`);
+    if (!item.pages.length) {
+      console.log('  (no page targets)');
+      continue;
+    }
+    for (const page of item.pages) {
+      const tabId = page.id || page.targetId || '(no-id)';
+      const title = page.title || '(untitled)';
+      console.log(`  ${tabId} ${title}`);
+      console.log(`    ${page.url || '(no-url)'}`);
+    }
+  }
 };
 
 // neo label <domain> [--dry-run]
@@ -3690,6 +3738,7 @@ Commands:
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
   neo connect [port]                      Connect to CDP and save active session
+  neo discover                            Discover reachable CDP endpoints on localhost
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
