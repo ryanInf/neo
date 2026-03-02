@@ -26,6 +26,7 @@
 //   neo fill @ref "text"                     Clear then fill element by @ref
 //   neo type @ref "text"                     Type text without clearing
 //   neo press <key>                          Press keyboard key (supports Ctrl+a)
+//   neo hover @ref                           Hover over element by @ref
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1768,6 +1769,26 @@ commands.press = async function(args, context = {}) {
   await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', down);
   await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', up);
   console.log(`Pressed ${rawKey}`);
+};
+
+// neo hover @ref
+commands.hover = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  if (!ref || positional.length > 1) {
+    console.error('Usage: neo hover @ref');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+  await cdpSend(pageWsUrl, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved',
+    x: target.x,
+    y: target.y,
+  });
+  console.log(`Hovered ${ref}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4316,6 +4337,7 @@ Commands:
   neo fill @ref "text"                     Clear then fill element by @ref
   neo type @ref "text"                     Type text without clearing
   neo press <key>                          Press keyboard key (supports Ctrl+a)
+  neo hover @ref                           Hover over element by @ref
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
