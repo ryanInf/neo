@@ -266,6 +266,34 @@ function resolveElectronExecutable(appName, deps = {}) {
   };
 }
 
+function shellEscape(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function extractRemoteDebugPort(text) {
+  const input = String(text || '');
+  const match = input.match(/--remote-debugging-port(?:=|\s+)(\d{1,5})/);
+  if (!match) return null;
+  const port = parseInt(match[1], 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+function findElectronDebugPort(appName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : () => {
+    throw new Error('execSync stub required');
+  };
+  const normalized = String(appName || '').trim();
+  if (!normalized) return null;
+  const command = `ps aux | grep ${shellEscape(normalized)} | grep -- '--remote-debugging-port' | grep -v grep`;
+  try {
+    const output = String(execSyncFn(command) || '');
+    return extractRemoteDebugPort(output);
+  } catch {
+    return null;
+  }
+}
+
 function resetSessionFile() {
   try { fs.unlinkSync(SESSION_FILE); } catch {}
 }
@@ -643,6 +671,37 @@ test('resolveElectronExecutable reports unsupported app', () => {
   });
   assert.strictEqual(out.executable, null);
   assert.strictEqual(out.error, 'unsupported-on-linux');
+});
+
+console.log('\nElectron connect parsing:');
+test('extractRemoteDebugPort parses --remote-debugging-port with equals', () => {
+  const text = 'feishu --remote-debugging-port=9225 --foo bar';
+  assert.strictEqual(extractRemoteDebugPort(text), 9225);
+});
+
+test('extractRemoteDebugPort parses --remote-debugging-port with space', () => {
+  const text = 'feishu --remote-debugging-port 9226';
+  assert.strictEqual(extractRemoteDebugPort(text), 9226);
+});
+
+test('findElectronDebugPort extracts port from ps output', () => {
+  let captured = '';
+  const port = findElectronDebugPort('feishu', {
+    execSync: (cmd) => {
+      captured = cmd;
+      return 'fourier  123  1.2  feishu --remote-debugging-port=9225';
+    },
+  });
+  assert.strictEqual(port, 9225);
+  assert.ok(captured.includes('ps aux | grep'));
+  assert.ok(captured.includes("'feishu'"));
+});
+
+test('findElectronDebugPort returns null when no debug flag is found', () => {
+  const port = findElectronDebugPort('feishu', {
+    execSync: () => 'fourier  123  1.2  feishu --flag without-port',
+  });
+  assert.strictEqual(port, null);
 });
 
 console.log('\nsession store:');

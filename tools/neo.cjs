@@ -20,6 +20,7 @@
 //   neo read <tab-pattern>                  Extract readable text from page
 //   neo launch <app> [--port N]             Launch Electron app with CDP enabled
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
+//   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
 //   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo sessions                            List saved active sessions
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
@@ -158,6 +159,32 @@ function resolveElectronExecutable(appName, deps = {}) {
     error: 'executable-not-found',
     candidates,
   };
+}
+
+function extractRemoteDebugPort(text) {
+  const input = String(text || '');
+  const match = input.match(/--remote-debugging-port(?:=|\s+)(\d{1,5})/);
+  if (!match) return null;
+  const port = parseInt(match[1], 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+function findElectronDebugPort(appName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : execSync;
+  const normalized = String(appName || '').trim();
+  if (!normalized) return null;
+  const command = `ps aux | grep ${shellEscape(normalized)} | grep -- '--remote-debugging-port' | grep -v grep`;
+  try {
+    const output = String(execSyncFn(command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/sh',
+    }) || '');
+    return extractRemoteDebugPort(output);
+  } catch {
+    return null;
+  }
 }
 
 async function waitForCdpPort(port, timeoutMs = 10000, intervalMs = 250, deps = {}) {
@@ -1667,6 +1694,31 @@ function stripGlobalSessionFlag(argv) {
   return clean;
 }
 
+async function connectToCdpPort(port, sessionName = DEFAULT_SESSION_NAME) {
+  const cdpUrl = `http://localhost:${port}`;
+  const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
+  const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
+  const page = targets.find(target => target.type === 'page');
+  if (!page) {
+    throw new Error(`Connected to ${cdpUrl} but no page target found`);
+  }
+
+  const tabId = page.id || page.targetId || '';
+  setSession(sessionName, {
+    cdpUrl,
+    pageWsUrl: page.webSocketDebuggerUrl || '',
+    tabId,
+    refs: {},
+  });
+
+  return {
+    cdpUrl,
+    versionInfo,
+    tabId,
+    page,
+  };
+}
+
 // ─── Commands ───────────────────────────────────────────────────
 
 const commands = {};
@@ -1721,35 +1773,34 @@ commands.launch = async function(args) {
 
 // neo connect [port]
 commands.connect = async function(args, context = {}) {
-  const { positional } = parseArgs(args || []);
-  const rawPort = positional[0];
+  const { positional, flags } = parseArgs(args || []);
+  const electronApp = flags.electron ? String(flags.electron) : null;
+  let rawPort = positional[0];
+  if (electronApp) {
+    if (flags.electron === true || positional.length > 0) {
+      console.error('Usage: neo connect [port] | neo connect --electron <app-name>');
+      process.exit(1);
+    }
+    const discoveredPort = findElectronDebugPort(electronApp);
+    if (!discoveredPort) {
+      throw new Error(`No running Electron app "${electronApp}" with --remote-debugging-port found. Run: neo launch ${normalizeElectronAppName(electronApp)}`);
+    }
+    rawPort = String(discoveredPort);
+  }
+
   const port = rawPort ? parseInt(rawPort, 10) : 9222;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     console.error(`Invalid port: ${rawPort}`);
-    console.error('Usage: neo connect [port]');
+    console.error('Usage: neo connect [port] | neo connect --electron <app-name>');
     process.exit(1);
   }
 
-  const cdpUrl = `http://localhost:${port}`;
-  const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
-  const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
-  const page = targets.find(target => target.type === 'page');
-  if (!page) {
-    throw new Error(`Connected to ${cdpUrl} but no page target found`);
-  }
-
   const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
-  const tabId = page.id || page.targetId || '';
-  setSession(sessionName, {
-    cdpUrl,
-    pageWsUrl: page.webSocketDebuggerUrl || '',
-    tabId,
-    refs: {},
-  });
+  const connected = await connectToCdpPort(port, sessionName);
 
-  console.log(`Connected: ${versionInfo.Browser || 'CDP'} @ ${cdpUrl}`);
+  console.log(`Connected: ${connected.versionInfo.Browser || 'CDP'} @ ${connected.cdpUrl}`);
   console.log(`Session: ${sessionName}`);
-  console.log(`Tab: ${tabId || '(no-id)'} ${page.title ? `- ${page.title}` : ''}`);
+  console.log(`Tab: ${connected.tabId || '(no-id)'} ${connected.page.title ? `- ${connected.page.title}` : ''}`);
 };
 
 // neo discover
@@ -4782,6 +4833,7 @@ Commands:
   neo read <tab-pattern>                  Extract readable text from page
   neo launch <app> [--port N]             Launch Electron app with CDP enabled
   neo connect [port]                      Connect to CDP and save active session
+  neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
   neo discover                            Discover reachable CDP endpoints on localhost
   neo sessions                            List saved active sessions
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
