@@ -23,6 +23,7 @@
 //   neo sessions                            List saved active sessions
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
 //   neo click @ref [--new-tab]              Click element by @ref
+//   neo fill @ref "text"                     Clear then fill element by @ref
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1602,6 +1603,49 @@ commands.click = async function(args, context = {}) {
     type: 'mouseReleased',
   });
   console.log(`Clicked ${ref}`);
+};
+
+// neo fill @ref "text"
+commands.fill = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const ref = positional[0];
+  const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
+  if (!ref || text === null) {
+    console.error('Usage: neo fill @ref "text"');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const target = await resolveRef(sessionName, ref);
+
+  await cdpSend(pageWsUrl, 'DOM.focus', {
+    backendNodeId: target.backendDOMNodeId,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'a',
+    code: 'KeyA',
+    modifiers: 2,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'a',
+    code: 'KeyA',
+    modifiers: 2,
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'Backspace',
+    code: 'Backspace',
+  });
+  await cdpSend(pageWsUrl, 'Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'Backspace',
+    code: 'Backspace',
+  });
+  await cdpSend(pageWsUrl, 'Input.insertText', { text });
+  console.log(`Filled ${ref}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4147,6 +4191,7 @@ Commands:
   neo sessions                            List saved active sessions
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
   neo click @ref [--new-tab]              Click element by @ref
+  neo fill @ref "text"                     Clear then fill element by @ref
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
