@@ -194,6 +194,85 @@ function resetSessionFile() {
   try { fs.unlinkSync(SESSION_FILE); } catch {}
 }
 
+function axValueToString(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (typeof value === 'object' && value.value !== undefined && value.value !== null) {
+    return String(value.value);
+  }
+  return '';
+}
+
+function assignRefs(axTreeNodes) {
+  const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
+  const nodeById = new Map();
+  const childIds = new Set();
+
+  for (const node of sourceNodes) {
+    if (node.nodeId === undefined || node.nodeId === null) continue;
+    nodeById.set(String(node.nodeId), node);
+  }
+
+  for (const node of sourceNodes) {
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      childIds.add(String(childId));
+    }
+  }
+
+  const roots = sourceNodes.filter((node) => {
+    if (node.nodeId === undefined || node.nodeId === null) return true;
+    return !childIds.has(String(node.nodeId));
+  });
+
+  const visited = new Set();
+  const nodes = [];
+  const refs = {};
+  let nextRef = 1;
+
+  function visit(node, depth) {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    const ref = `@e${nextRef++}`;
+    const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
+    const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
+    const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
+    const bounds = node.bounds && typeof node.bounds === 'object' ? node.bounds : null;
+
+    nodes.push({ ref, depth, role, name, backendDOMNodeId, bounds });
+    refs[ref] = { backendDOMNodeId, role, name, bounds };
+
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      const childNode = nodeById.get(String(childId));
+      if (childNode) visit(childNode, depth + 1);
+    }
+  }
+
+  for (const root of roots) visit(root, 0);
+  for (const node of sourceNodes) {
+    if (!visited.has(node)) visit(node, 0);
+  }
+
+  return { nodes, refs };
+}
+
+function formatSnapshot(nodes) {
+  const rows = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node || typeof node !== 'object') continue;
+    const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
+    const indent = '  '.repeat(depth);
+    const ref = String(node.ref || '@e?');
+    const role = String(node.role || 'unknown');
+    const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
+    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+  }
+  return rows.join('\n');
+}
+
 // ─── Tests ──────────────────────────────────────────────────────
 
 console.log('\nisAuthHeader:');
@@ -367,6 +446,77 @@ test('saveSessions normalizes invalid input to empty object', () => {
   resetSessionFile();
   saveSessions(null);
   assert.deepStrictEqual(loadSessions(), {});
+});
+
+console.log('\nassignRefs + formatSnapshot:');
+test('assignRefs traverses tree in preorder with depth and refs map', () => {
+  const tree = [
+    {
+      nodeId: '1',
+      role: { value: 'RootWebArea' },
+      name: { value: 'Main App' },
+      childIds: ['2', '3'],
+      backendDOMNodeId: 101,
+    },
+    {
+      nodeId: '2',
+      role: { value: 'button' },
+      name: { value: ' Submit ' },
+      backendDOMNodeId: 102,
+      childIds: [],
+      bounds: { x: 10, y: 20, width: 30, height: 40 },
+    },
+    {
+      nodeId: '3',
+      role: { value: 'link' },
+      name: { value: 'Home' },
+      backendDOMNodeId: 103,
+      childIds: ['4'],
+    },
+    {
+      nodeId: '4',
+      role: { value: 'textbox' },
+      name: { value: 'Search' },
+      backendDOMNodeId: 104,
+      childIds: [],
+    },
+  ];
+  const result = assignRefs(tree);
+  assert.strictEqual(result.nodes.length, 4);
+  assert.deepStrictEqual(result.nodes.map(n => n.ref), ['@e1', '@e2', '@e3', '@e4']);
+  assert.deepStrictEqual(result.nodes.map(n => n.depth), [0, 1, 1, 2]);
+  assert.strictEqual(result.refs['@e1'].backendDOMNodeId, 101);
+  assert.strictEqual(result.refs['@e2'].role, 'button');
+  assert.strictEqual(result.refs['@e2'].name, 'Submit');
+  assert.deepStrictEqual(result.refs['@e2'].bounds, { x: 10, y: 20, width: 30, height: 40 });
+});
+
+test('assignRefs includes disconnected nodes and normalizes missing fields', () => {
+  const result = assignRefs([
+    { nodeId: '1', role: null, name: null, childIds: ['2'] },
+    { nodeId: '2', role: { value: 'Button' }, name: { value: 'Click' }, childIds: [] },
+    { nodeId: '3', role: { value: 'Link' }, name: { value: 'More' }, childIds: [] },
+  ]);
+  assert.strictEqual(result.nodes.length, 3);
+  assert.strictEqual(result.nodes[0].role, 'unknown');
+  assert.strictEqual(result.nodes[2].role, 'link');
+  assert.strictEqual(result.refs['@e3'].name, 'More');
+});
+
+test('formatSnapshot renders indented lines and escapes quotes', () => {
+  const text = formatSnapshot([
+    { ref: '@e1', depth: 0, role: 'button', name: 'Save "Now"' },
+    { ref: '@e2', depth: 1, role: 'textbox', name: 'Search' },
+  ]);
+  assert.strictEqual(
+    text,
+    '@e1  [button] "Save \\"Now\\""\n  @e2  [textbox] "Search"'
+  );
+});
+
+test('formatSnapshot ignores invalid nodes and falls back to defaults', () => {
+  const text = formatSnapshot([null, { depth: -1, name: 'X' }]);
+  assert.strictEqual(text, '@e?  [unknown] "X"');
 });
 
 // ─── Interceptor utils (extracted pure functions) ───────────────
