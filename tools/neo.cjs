@@ -18,6 +18,7 @@
 //   neo open <url>                          Open URL in Chrome
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
+//   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -132,6 +133,14 @@ function dbEval(body) {
     req.onerror = function() { resolve("Error: " + req.error); };
     setTimeout(function() { resolve("timeout"); }, 10000);
   })`;
+}
+
+async function fetchJsonOrThrow(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} for ${url}`);
+  }
+  return response.json();
 }
 
 const AUTH_HEADER_PATTERNS = [
@@ -1111,6 +1120,39 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+// neo connect [port]
+commands.connect = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const rawPort = positional[0];
+  const port = rawPort ? parseInt(rawPort, 10) : 9222;
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    console.error(`Invalid port: ${rawPort}`);
+    console.error('Usage: neo connect [port]');
+    process.exit(1);
+  }
+
+  const cdpUrl = `http://localhost:${port}`;
+  const versionInfo = await fetchJsonOrThrow(`${cdpUrl}/json/version`);
+  const targets = await fetchJsonOrThrow(`${cdpUrl}/json/list`);
+  const page = targets.find(target => target.type === 'page');
+  if (!page) {
+    throw new Error(`Connected to ${cdpUrl} but no page target found`);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const tabId = page.id || page.targetId || '';
+  setSession(sessionName, {
+    cdpUrl,
+    pageWsUrl: page.webSocketDebuggerUrl || '',
+    tabId,
+    refs: {},
+  });
+
+  console.log(`Connected: ${versionInfo.Browser || 'CDP'} @ ${cdpUrl}`);
+  console.log(`Session: ${sessionName}`);
+  console.log(`Tab: ${tabId || '(no-id)'} ${page.title ? `- ${page.title}` : ''}`);
 };
 
 // neo label <domain> [--dry-run]
@@ -3647,6 +3689,7 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo connect [port]                      Connect to CDP and save active session
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
