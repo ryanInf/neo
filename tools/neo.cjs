@@ -21,6 +21,7 @@
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo sessions                            List saved active sessions
+//   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -39,6 +40,11 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const DEFAULT_SESSION_NAME = '__default__';
+const INTERACTIVE_ROLES = new Set([
+  'button', 'textbox', 'link', 'combobox', 'checkbox', 'menuitem', 'tab',
+  'radio', 'slider', 'switch', 'searchbox', 'spinbutton', 'option',
+  'treeitem', 'menuitemcheckbox', 'menuitemradio', 'listbox'
+]);
 
 function loadSessions() {
   if (!fs.existsSync(SESSION_FILE)) return {};
@@ -178,6 +184,85 @@ function cdpEval(wsUrl, expression, timeout = 30000) {
     });
     ws.on('error', err => { clearTimeout(timer); reject(err); });
   });
+}
+
+function axValueToString(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (typeof value === 'object' && value.value !== undefined && value.value !== null) {
+    return String(value.value);
+  }
+  return '';
+}
+
+function assignRefs(axTreeNodes) {
+  const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
+  const nodeById = new Map();
+  const childIds = new Set();
+
+  for (const node of sourceNodes) {
+    if (node.nodeId === undefined || node.nodeId === null) continue;
+    nodeById.set(String(node.nodeId), node);
+  }
+
+  for (const node of sourceNodes) {
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      childIds.add(String(childId));
+    }
+  }
+
+  const roots = sourceNodes.filter((node) => {
+    if (node.nodeId === undefined || node.nodeId === null) return true;
+    return !childIds.has(String(node.nodeId));
+  });
+
+  const visited = new Set();
+  const nodes = [];
+  const refs = {};
+  let nextRef = 1;
+
+  function visit(node, depth) {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    const ref = `@e${nextRef++}`;
+    const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
+    const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
+    const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
+    const bounds = node.bounds && typeof node.bounds === 'object' ? node.bounds : null;
+
+    nodes.push({ ref, depth, role, name, backendDOMNodeId, bounds });
+    refs[ref] = { backendDOMNodeId, role, name, bounds };
+
+    for (const childId of Array.isArray(node.childIds) ? node.childIds : []) {
+      const childNode = nodeById.get(String(childId));
+      if (childNode) visit(childNode, depth + 1);
+    }
+  }
+
+  for (const root of roots) visit(root, 0);
+  for (const node of sourceNodes) {
+    if (!visited.has(node)) visit(node, 0);
+  }
+
+  return { nodes, refs };
+}
+
+function formatSnapshot(nodes) {
+  const rows = [];
+  for (const node of Array.isArray(nodes) ? nodes : []) {
+    if (!node || typeof node !== 'object') continue;
+    const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
+    const indent = '  '.repeat(depth);
+    const ref = String(node.ref || '@e?');
+    const role = String(node.role || 'unknown');
+    const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
+    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+  }
+  return rows.join('\n');
 }
 
 function dbEval(body) {
@@ -1161,6 +1246,49 @@ function loadDependencyData(wsUrl, domain) {
 
 // ─── CLI Parsing ────────────────────────────────────────────────
 
+function parseSnapshotArgs(argv) {
+  const options = {
+    interactiveOnly: false,
+    includeCursorPointer: false,
+    json: false,
+    selector: null,
+  };
+  const unknown = [];
+
+  const args = Array.isArray(argv) ? argv : [];
+  for (let i = 0; i < args.length; i++) {
+    const current = args[i];
+    if (current === '-i') {
+      options.interactiveOnly = true;
+      continue;
+    }
+    if (current === '-C') {
+      options.includeCursorPointer = true;
+      continue;
+    }
+    if (current === '--json') {
+      options.json = true;
+      continue;
+    }
+    if (current === '--selector') {
+      if (args[i + 1] && !args[i + 1].startsWith('-')) {
+        options.selector = args[i + 1];
+        i++;
+      } else {
+        unknown.push(current);
+      }
+      continue;
+    }
+    if (current.startsWith('--selector=')) {
+      options.selector = current.slice('--selector='.length);
+      continue;
+    }
+    unknown.push(current);
+  }
+
+  return { options, unknown };
+}
+
 function parseArgs(argv) {
   const positional = [];
   const flags = {};
@@ -1318,6 +1446,63 @@ commands.sessions = function() {
     const tab = data.tabId || '(no-tab)';
     console.log(`${name} ${data.cdpUrl} ${tab}`);
   }
+};
+
+// neo snapshot [-i] [-C] [--json] [--selector css]
+commands.snapshot = async function(args, context = {}) {
+  const { options, unknown } = parseSnapshotArgs(args || []);
+  if (unknown.length > 0) {
+    console.error('Usage: neo snapshot [-i] [-C] [--json] [--selector css]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    console.error('Run neo connect [port] first');
+    process.exit(1);
+  }
+
+  await cdpSend(session.pageWsUrl, 'Accessibility.enable');
+  const treeResult = await cdpSend(session.pageWsUrl, 'Accessibility.getFullAXTree');
+  const assigned = assignRefs(treeResult && Array.isArray(treeResult.nodes) ? treeResult.nodes : []);
+
+  const displayNodes = options.interactiveOnly
+    ? assigned.nodes.filter(node => INTERACTIVE_ROLES.has(String(node.role || '').toLowerCase()))
+    : assigned.nodes;
+
+  setSession(sessionName, {
+    ...session,
+    refs: assigned.refs,
+  });
+
+  if (options.includeCursorPointer) {
+    // TODO: Add Runtime.evaluate scan for cursor:pointer elements.
+    console.error('TODO: snapshot -C (cursor:pointer) is not implemented yet');
+  }
+  if (options.selector) {
+    // TODO: Add CSS selector scoped snapshot filtering.
+    console.error('TODO: snapshot --selector is not implemented yet');
+  }
+
+  if (options.json) {
+    const refs = {};
+    for (const node of displayNodes) {
+      if (node && node.ref && assigned.refs[node.ref]) {
+        refs[node.ref] = assigned.refs[node.ref];
+      }
+    }
+    console.log(JSON.stringify({
+      session: sessionName,
+      count: displayNodes.length,
+      nodes: displayNodes,
+      refs,
+    }, null, 2));
+    return;
+  }
+
+  const output = formatSnapshot(displayNodes);
+  console.log(output || '(empty snapshot)');
 };
 
 // neo label <domain> [--dry-run]
@@ -3861,6 +4046,7 @@ Commands:
   neo connect [port]                      Connect to CDP and save active session
   neo discover                            Discover reachable CDP endpoints on localhost
   neo sessions                            List saved active sessions
+  neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
