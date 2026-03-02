@@ -31,6 +31,7 @@
 //   neo select @ref "value"                  Select option value by @ref
 //   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
 //   neo get text @ref | neo get url | neo get title  Extract page/element info
+//   neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -431,6 +432,71 @@ async function resolveScrollPoint(pageWsUrl, selector) {
     x: Number(value.x),
     y: Number(value.y),
   };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function selectorFromObject(pageWsUrl, objectId) {
+  const result = await cdpSend(pageWsUrl, 'Runtime.callFunctionOn', {
+    objectId,
+    functionDeclaration: `function() {
+      function fallbackEscape(value) {
+        return String(value || '').replace(/[^a-zA-Z0-9_\\-]/g, '\\\\$&');
+      }
+      function esc(value) {
+        if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(value);
+        return fallbackEscape(value);
+      }
+      if (!this || this.nodeType !== 1) return '';
+      if (this.id) return '#' + esc(this.id);
+      var parts = [];
+      var node = this;
+      while (node && node.nodeType === 1 && parts.length < 8) {
+        var part = node.nodeName.toLowerCase();
+        if (node.classList && node.classList.length > 0) {
+          part += '.' + Array.from(node.classList).slice(0, 2).map(esc).join('.');
+        }
+        var parent = node.parentElement;
+        if (parent) {
+          var siblings = Array.from(parent.children).filter(function(child) {
+            return child.nodeName === node.nodeName;
+          });
+          if (siblings.length > 1) {
+            part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+          }
+        }
+        parts.unshift(part);
+        if (node.id) break;
+        node = parent;
+      }
+      return parts.join(' > ');
+    }`,
+    returnByValue: true,
+  });
+  const selector = result && result.result ? result.result.value : '';
+  return typeof selector === 'string' ? selector.trim() : '';
+}
+
+async function waitForSelector(pageWsUrl, selector, timeoutMs = 10000, intervalMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const doc = await cdpSend(pageWsUrl, 'DOM.getDocument', { depth: 1, pierce: true });
+    const rootNodeId = doc && doc.root && doc.root.nodeId;
+    if (Number.isInteger(rootNodeId)) {
+      const found = await cdpSend(pageWsUrl, 'DOM.querySelector', {
+        nodeId: rootNodeId,
+        selector,
+      });
+      if (found && Number.isInteger(found.nodeId) && found.nodeId > 0) {
+        return true;
+      }
+    }
+    if (Date.now() + intervalMs > deadline) break;
+    await sleep(intervalMs);
+  }
+  return false;
 }
 
 function dbEval(body) {
@@ -1994,6 +2060,52 @@ commands.get = async function(args, context = {}) {
 
   console.error('Usage: neo get text @ref | neo get url | neo get title');
   process.exit(1);
+};
+
+// neo wait @ref | neo wait --load networkidle | neo wait <ms>
+commands.wait = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+
+  if (flags.load !== undefined) {
+    if (String(flags.load || '').toLowerCase() !== 'networkidle') {
+      console.error('Usage: neo wait --load networkidle');
+      process.exit(1);
+    }
+    await sleep(2000);
+    console.log('Waited for networkidle (2000ms)');
+    return;
+  }
+
+  const target = positional[0];
+  if (!target || positional.length > 1) {
+    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    process.exit(1);
+  }
+
+  if (target.startsWith('@')) {
+    const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+    const pageWsUrl = getSessionPageWsUrl(sessionName);
+    const resolved = await resolveRef(sessionName, target);
+    const selector = await selectorFromObject(pageWsUrl, resolved.objectId);
+    if (!selector) {
+      throw new Error(`Failed to derive selector for ${target}`);
+    }
+    const ok = await waitForSelector(pageWsUrl, selector, 10000, 500);
+    if (!ok) {
+      console.error(`Timeout waiting for ${target}`);
+      process.exit(1);
+    }
+    console.log(`Found ${target}`);
+    return;
+  }
+
+  const ms = parseInt(target, 10);
+  if (!Number.isInteger(ms) || ms < 0) {
+    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    process.exit(1);
+  }
+  await sleep(ms);
+  console.log(`Waited ${ms}ms`);
 };
 
 // neo label <domain> [--dry-run]
@@ -4547,6 +4659,7 @@ Commands:
   neo select @ref "value"                  Select option value by @ref
   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
   neo get text @ref | neo get url | neo get title  Extract page/element info
+  neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
