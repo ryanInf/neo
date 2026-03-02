@@ -25,6 +25,7 @@
 //   neo sessions                            List saved active sessions
 //   neo tab                                 List CDP targets in the active session
 //   neo tab <index> | neo tab --url <pat>  Switch active tab target
+//   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
 //   neo click @ref [--new-tab]              Click element by @ref
 //   neo fill @ref "text"                     Clear then fill element by @ref
@@ -1754,6 +1755,81 @@ function updateSessionTab(sessionName, cdpUrl, target) {
   });
 }
 
+async function listSessionTargets(sessionName = DEFAULT_SESSION_NAME) {
+  const cdpUrl = getSessionCdpUrl(sessionName);
+  const targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  return { cdpUrl, targets };
+}
+
+function findTabTargetByUrlPattern(targets, pattern) {
+  const list = Array.isArray(targets) ? targets : [];
+  const input = String(pattern || '');
+  if (!input) return null;
+  return list.find(target => target.url.includes(input)) || null;
+}
+
+function activateSessionTarget(sessionName, cdpUrl, target) {
+  if (!target || !target.webSocketDebuggerUrl) {
+    throw new Error(`Target ${target && (target.id || target.index)} does not expose webSocketDebuggerUrl`);
+  }
+  updateSessionTab(sessionName, cdpUrl, target);
+  return target;
+}
+
+async function switchSessionTabByUrl(sessionName, pattern) {
+  const { cdpUrl, targets } = await listSessionTargets(sessionName);
+  const selected = findTabTargetByUrlPattern(targets, pattern);
+  if (!selected) {
+    throw new Error(`No tab matching URL pattern: ${pattern}`);
+  }
+  return activateSessionTarget(sessionName, cdpUrl, selected);
+}
+
+function loadInjectScriptSource(deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : fs.readFileSync;
+  const rootDir = deps.rootDir || path.join(fs.realpathSync(__dirname), '..');
+  const primary = path.join(rootDir, 'extension', 'inject.js');
+  const fallback = path.join(rootDir, 'extension-dist', 'content.js');
+
+  if (existsSyncFn(primary)) {
+    return { sourcePath: primary, source: readFileSyncFn(primary, 'utf8') };
+  }
+  if (existsSyncFn(fallback)) {
+    return { sourcePath: fallback, source: readFileSyncFn(fallback, 'utf8') };
+  }
+  throw new Error(`Inject script not found. Tried: ${primary} and ${fallback}`);
+}
+
+function buildInjectScript(sourceCode) {
+  const raw = String(sourceCode || '');
+  return `(function() {
+  try {
+    if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
+      globalThis.__NEO_CAPTURES__ = [];
+    }
+    if (typeof globalThis.__neoMiniReporter !== 'function') {
+      globalThis.__neoMiniReporter = function(event, payload) {
+        try {
+          console.debug('[neo:inject]', event, payload || {});
+        } catch {}
+      };
+    }
+    globalThis.__neoMiniReporter('inject:start', { captures: globalThis.__NEO_CAPTURES__.length });
+    (function() {
+${raw}
+    }).call(globalThis);
+    globalThis.__neoMiniReporter('inject:ready', { captures: globalThis.__NEO_CAPTURES__.length });
+    return { ok: true, captures: globalThis.__NEO_CAPTURES__.length };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  }
+})();`;
+}
+
 // ─── Commands ───────────────────────────────────────────────────
 
 const commands = {};
@@ -1906,8 +1982,7 @@ commands.sessions = function() {
 commands.tab = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args || []);
   const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
-  const cdpUrl = getSessionCdpUrl(sessionName);
-  const targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  const { cdpUrl, targets } = await listSessionTargets(sessionName);
   if (!targets.length) {
     console.log('No CDP targets found');
     return;
@@ -1931,10 +2006,9 @@ commands.tab = async function(args, context = {}) {
 
   let selected = null;
   if (urlPattern !== null) {
-    const pattern = String(urlPattern);
-    selected = targets.find(target => target.url.includes(pattern)) || null;
+    selected = findTabTargetByUrlPattern(targets, String(urlPattern));
     if (!selected) {
-      throw new Error(`No tab matching URL pattern: ${pattern}`);
+      throw new Error(`No tab matching URL pattern: ${String(urlPattern)}`);
     }
   } else {
     const index = parseInt(String(positional[0]), 10);
@@ -1944,12 +2018,53 @@ commands.tab = async function(args, context = {}) {
     selected = targets[index];
   }
 
-  if (!selected.webSocketDebuggerUrl) {
-    throw new Error(`Target ${selected.id || selected.index} does not expose webSocketDebuggerUrl`);
+  activateSessionTarget(sessionName, cdpUrl, selected);
+  console.log(`Switched to tab ${selected.index}: ${selected.id || '(no-id)'} ${selected.title || '(untitled)'}`);
+};
+
+// neo inject [--persist] [--tab pattern]
+commands.inject = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 0 || flags.tab === true) {
+    console.error('Usage: neo inject [--persist] [--tab pattern]');
+    process.exit(1);
   }
 
-  updateSessionTab(sessionName, cdpUrl, selected);
-  console.log(`Switched to tab ${selected.index}: ${selected.id || '(no-id)'} ${selected.title || '(untitled)'}`);
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  if (flags.tab !== undefined) {
+    await switchSessionTabByUrl(sessionName, String(flags.tab));
+  }
+
+  const session = getSession(sessionName);
+  if (!session || !session.pageWsUrl) {
+    console.error('Run neo connect [port] first');
+    process.exit(1);
+  }
+
+  const loaded = loadInjectScriptSource();
+  const script = buildInjectScript(loaded.source);
+  const evaluated = await cdpSend(session.pageWsUrl, 'Runtime.evaluate', {
+    expression: script,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (evaluated && evaluated.exceptionDetails) {
+    throw new Error('Inject evaluate failed');
+  }
+
+  const payload = evaluated && evaluated.result ? evaluated.result.value : null;
+  if (!payload || payload.ok !== true) {
+    throw new Error(payload && payload.error ? payload.error : 'Inject script failed');
+  }
+
+  if (flags.persist !== undefined) {
+    await cdpSend(session.pageWsUrl, 'Page.addScriptToEvaluateOnNewDocument', {
+      source: script,
+    });
+  }
+
+  const persisted = flags.persist !== undefined ? ' (persist)' : '';
+  console.log(`Injected Neo capture script${persisted}`);
 };
 
 // neo snapshot [-i] [-C] [--json] [--selector css]
@@ -4923,6 +5038,7 @@ Commands:
   neo sessions                            List saved active sessions
   neo tab                                 List CDP targets in the active session
   neo tab <index> | neo tab --url <pat>  Switch active tab target
+  neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
   neo click @ref [--new-tab]              Click element by @ref
   neo fill @ref "text"                     Clear then fill element by @ref

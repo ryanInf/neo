@@ -310,6 +310,58 @@ function parseTabTargets(targets) {
   });
 }
 
+function findTabTargetByUrlPattern(targets, pattern) {
+  const list = Array.isArray(targets) ? targets : [];
+  const input = String(pattern || '');
+  if (!input) return null;
+  return list.find(target => target.url.includes(input)) || null;
+}
+
+function loadInjectScriptSource(deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : () => '';
+  const rootDir = deps.rootDir || '/tmp/project';
+  const primary = path.join(rootDir, 'extension', 'inject.js');
+  const fallback = path.join(rootDir, 'extension-dist', 'content.js');
+
+  if (existsSyncFn(primary)) {
+    return { sourcePath: primary, source: readFileSyncFn(primary, 'utf8') };
+  }
+  if (existsSyncFn(fallback)) {
+    return { sourcePath: fallback, source: readFileSyncFn(fallback, 'utf8') };
+  }
+  throw new Error(`Inject script not found. Tried: ${primary} and ${fallback}`);
+}
+
+function buildInjectScript(sourceCode) {
+  const raw = String(sourceCode || '');
+  return `(function() {
+  try {
+    if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
+      globalThis.__NEO_CAPTURES__ = [];
+    }
+    if (typeof globalThis.__neoMiniReporter !== 'function') {
+      globalThis.__neoMiniReporter = function(event, payload) {
+        try {
+          console.debug('[neo:inject]', event, payload || {});
+        } catch {}
+      };
+    }
+    globalThis.__neoMiniReporter('inject:start', { captures: globalThis.__NEO_CAPTURES__.length });
+    (function() {
+${raw}
+    }).call(globalThis);
+    globalThis.__neoMiniReporter('inject:ready', { captures: globalThis.__NEO_CAPTURES__.length });
+    return { ok: true, captures: globalThis.__NEO_CAPTURES__.length };
+  } catch (error) {
+    return {
+      ok: false,
+      error: String(error && error.message ? error.message : error),
+    };
+  }
+})();`;
+}
+
 function resetSessionFile() {
   try { fs.unlinkSync(SESSION_FILE); } catch {}
 }
@@ -767,6 +819,43 @@ test('parseTabTargets handles invalid input defensively', () => {
     url: '',
     webSocketDebuggerUrl: '',
   });
+});
+
+test('findTabTargetByUrlPattern matches first URL include', () => {
+  const targets = parseTabTargets([
+    { type: 'page', id: '1', url: 'https://example.com/home' },
+    { type: 'page', id: '2', url: 'https://example.com/settings' },
+  ]);
+  const matched = findTabTargetByUrlPattern(targets, '/settings');
+  assert.strictEqual(matched.id, '2');
+});
+
+console.log('\nInject script loading:');
+test('loadInjectScriptSource prefers extension/inject.js', () => {
+  const loaded = loadInjectScriptSource({
+    rootDir: '/repo',
+    existsSync: (p) => p === '/repo/extension/inject.js',
+    readFileSync: (p) => `from:${p}`,
+  });
+  assert.strictEqual(loaded.sourcePath, '/repo/extension/inject.js');
+  assert.strictEqual(loaded.source, 'from:/repo/extension/inject.js');
+});
+
+test('loadInjectScriptSource falls back to extension-dist/content.js', () => {
+  const loaded = loadInjectScriptSource({
+    rootDir: '/repo',
+    existsSync: (p) => p === '/repo/extension-dist/content.js',
+    readFileSync: (p) => `from:${p}`,
+  });
+  assert.strictEqual(loaded.sourcePath, '/repo/extension-dist/content.js');
+  assert.strictEqual(loaded.source, 'from:/repo/extension-dist/content.js');
+});
+
+test('buildInjectScript wraps source with reporter and capture array', () => {
+  const script = buildInjectScript('globalThis.__NEO_CAPTURES__.push({ ok: true });');
+  assert.ok(script.includes('__NEO_CAPTURES__'));
+  assert.ok(script.includes('__neoMiniReporter'));
+  assert.ok(script.includes('inject:ready'));
 });
 
 console.log('\nsession store:');
