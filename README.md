@@ -15,10 +15,13 @@ AI agents operating web apps today have two options, both bad:
 
 **Neo is the third way.** Every web app already has a complete internal API — the frontend calls it every time you click something. Neo captures those calls and makes them replayable.
 
+**v2: Now with UI automation.** Neo v2 adds an accessibility-tree-based UI layer — `snapshot`, `click`, `fill`, `type`, `press`, `hover`, `scroll`, `select`, `screenshot`, `get`, `wait`. When an API exists, use it directly. When it doesn't, Neo can drive the UI through the same CLI. One tool, both layers.
+
 ## How It Works
 
 ```
 Browse normally → Neo records all API traffic → Schema auto-generated → AI replays APIs directly
+                                                                      → Or drives UI via a11y tree
 ```
 
 ### 1. Capture (always-on)
@@ -38,6 +41,7 @@ Run API calls inside the browser tab's context via Chrome DevTools Protocol. Coo
 ```bash
 git clone https://github.com/4ier/neo.git
 cd neo && npm install && npm run build
+npm link  # makes `neo` available globally
 ```
 
 Load the extension:
@@ -48,86 +52,127 @@ Load the extension:
 
 ## CLI Tools
 
-All commands go through a single CLI: `node tools/neo.cjs <command>`.
+All commands go through a single CLI: `neo <command>`.
 
-Requires Chrome launched with `--remote-debugging-port=9222`.
-
-Single CLI, subcommand-style (inspired by [notion-cli](https://github.com/4ier/notion-cli)):
+Requires a browser with CDP (Chrome DevTools Protocol) enabled.
 
 ```bash
-# Overview
-node tools/neo.cjs status
+# --- Connection & Sessions ---
+neo connect [port]                          # Connect to CDP, save session
+neo connect --electron <app-name>           # Auto-discover Electron app's CDP port
+neo launch <app> [--port N]                 # Launch Electron app with CDP enabled
+neo discover                                # Find reachable CDP endpoints on localhost
+neo sessions                                # List saved sessions
+neo tab                                     # List CDP targets in active session
+neo tab <index> | neo tab --url <pattern>   # Switch active tab target
+neo inject [--persist] [--tab pattern]      # Inject Neo capture script into target
 
-# Captured traffic
-node tools/neo.cjs capture summary                    # Quick overview
-node tools/neo.cjs capture list github.com --limit 10  # Shows IDs for replay/detail
-node tools/neo.cjs capture list --since 1h             # Time-filtered
-node tools/neo.cjs capture domains
-node tools/neo.cjs capture search "CreateTweet" --method POST
-node tools/neo.cjs capture watch x.com          # Live tail (like tail -f)
-node tools/neo.cjs capture stats x.com           # Method/status/timing breakdown
-node tools/neo.cjs capture export x.com --since 2h > x-captures.json
-node tools/neo.cjs capture export x.com --format har > x.har  # HAR 1.2 for Postman/devtools
-node tools/neo.cjs capture import x-captures.json     # Import captures from file
-node tools/neo.cjs capture prune --older-than 7d       # Delete old captures
-node tools/neo.cjs capture gc x.com              # Smart dedup (keep one per pattern)
-node tools/neo.cjs capture gc x.com --dry-run    # Preview what would be removed
+# --- Capture & Traffic ---
+neo status                                  # Overview of captured data
+neo capture summary                         # Quick overview
+neo capture list github.com --limit 10      # Shows IDs for replay/detail
+neo capture list --since 1h                 # Time-filtered
+neo capture domains
+neo capture search "CreateTweet" --method POST
+neo capture watch x.com                     # Live tail (like tail -f)
+neo capture stats x.com                     # Method/status/timing breakdown
+neo capture export x.com --since 2h > x.json
+neo capture export x.com --format har > x.har  # HAR 1.2 for Postman/devtools
+neo capture import x-captures.json
+neo capture prune --older-than 7d
+neo capture gc x.com [--dry-run]            # Smart dedup
 
-# Replay a captured API call
-node tools/neo.cjs replay <capture-id> --tab x.com
+# --- API Replay & Execution ---
+neo replay <capture-id> --tab x.com         # Replay a captured call
+neo exec <url> --method POST --body '{...}' --tab example.com --auto-headers
+neo api x.com HomeTimeline                  # Smart call (schema lookup + auto-auth)
 
-# API schema (auto-saves to local knowledge base)
-node tools/neo.cjs schema list                   # List all known schemas
-node tools/neo.cjs schema generate x.com         # Generate from captures
-node tools/neo.cjs schema generate --all         # Batch generate for all domains
-node tools/neo.cjs schema show x.com             # Human-readable summary
-node tools/neo.cjs schema show x.com --json      # Raw JSON
-node tools/neo.cjs schema openapi x.com          # Export as OpenAPI 3.0 spec
-node tools/neo.cjs schema diff x.com             # Show changes from previous version
-node tools/neo.cjs schema coverage               # Which domains have schemas vs just captures
+# --- Schema & Analysis ---
+neo schema generate x.com                   # Generate from captures
+neo schema generate --all                   # Batch all domains
+neo schema show x.com [--json]
+neo schema openapi x.com                    # Export OpenAPI 3.0 spec
+neo schema diff x.com                       # Changes from previous version
+neo schema coverage                         # Domains with/without schemas
+neo label x.com [--dry-run]                 # Semantic endpoint labels
+neo flows x.com [--window 5000]             # API call sequence patterns
+neo deps x.com [--min-confidence 1]         # Response→request data dependencies
+neo workflow discover|show|run <name>       # Multi-step workflow discovery & replay
+neo suggest x.com                           # AI capability analysis
+neo export-skill x.com                      # Generate agent-ready SKILL.md
 
-# Execute API calls (auth headers auto-detected from captures)
-node tools/neo.cjs exec "https://api.example.com/data" --method POST --body '{"key":"value"}' --tab example.com
+# --- UI Automation (v2) ---
+neo snapshot [-i] [-C] [--json]             # A11y tree with @ref mapping
+neo click @ref [--new-tab]                  # Click element by @ref
+neo fill @ref "text"                        # Clear + fill input
+neo type @ref "text"                        # Append text to input
+neo press <key>                             # Keyboard key (supports Ctrl+a, Enter, etc.)
+neo hover @ref                              # Hover over element
+neo scroll <dir> [px] [--selector css]      # Scroll by direction
+neo select @ref "value"                     # Set dropdown value
+neo screenshot [path] [--full] [--annotate] # Capture screenshot
+neo get text @ref | neo get url | neo get title  # Extract info
+neo wait @ref | neo wait --load networkidle | neo wait <ms>  # Wait for element/load/time
 
-# Smart API call (schema lookup + auto-auth + auto-tab)
-node tools/neo.cjs api x.com badge_count           # Zero-config authenticated call
-node tools/neo.cjs api x.com HomeTimeline           # Finds URL, auth, tab automatically
-node tools/neo.cjs api github.com notifications
+# --- Page Interaction ---
+neo read github.com                         # Extract readable text
+neo eval "document.title" --tab github.com  # Run JS in page
+neo open https://example.com                # Open URL
 
-# Analyze API patterns
-node tools/neo.cjs flows x.com                      # Discover call sequence patterns
-node tools/neo.cjs flows x.com --window 5000        # Custom time window
-node tools/neo.cjs deps x.com                       # Find response→request data dependencies
-node tools/neo.cjs deps x.com --min-confidence 1    # Show even single-occurrence links
-node tools/neo.cjs label x.com                      # Generate semantic labels for schema endpoints
-node tools/neo.cjs label x.com --dry-run            # Print labeling prompt only
-node tools/neo.cjs workflow discover x.com            # Discover multi-step workflows from dependencies
-node tools/neo.cjs workflow show upload                 # Show matching workflow definition
-node tools/neo.cjs workflow run upload                    # Execute workflow step-by-step
-node tools/neo.cjs suggest x.com                    # AI capability analysis for domain
-node tools/neo.cjs export-skill x.com               # Generate agent-ready API reference (Markdown)
+# --- Mock & Bridge ---
+neo mock x.com [--port 8080 --latency 200]  # Mock server from schema
+neo bridge [--json] [--interactive]          # Real-time WebSocket capture stream
 
-# Mock server
-node tools/neo.cjs mock x.com                       # Start mock server from schema
-node tools/neo.cjs mock x.com --port 8080 --latency 200
-
-# Page interaction
-node tools/neo.cjs read github.com
-node tools/neo.cjs eval "document.title" --tab github.com
-node tools/neo.cjs open https://example.com
-
-# WebSocket Bridge (real-time streaming)
-node tools/neo.cjs bridge                    # Start bridge, see captures live
-node tools/neo.cjs bridge --json             # NDJSON output for piping
-node tools/neo.cjs bridge --json | jq .      # Structured processing
-node tools/neo.cjs bridge --interactive      # Send commands to extension
-
-# Diagnostics
-node tools/neo.cjs doctor                    # Check Chrome, extension, schemas, bridge
-node tools/neo.cjs reload                    # Reload the extension from CLI
-node tools/neo.cjs tabs                      # List open Chrome tabs
-node tools/neo.cjs tabs github               # Filter tabs by URL/title
+# --- Diagnostics ---
+neo doctor                                  # Check Chrome, extension, schemas
+neo reload                                  # Reload extension from CLI
+neo tabs [filter]                           # List open Chrome tabs
 ```
+
+### Sessions & Multi-App Support
+
+Neo isn't just for Chrome. Any app with CDP support works — including Electron apps:
+
+```bash
+# Launch VS Code with CDP and connect
+neo launch code --port 9230
+neo snapshot                # See VS Code's accessibility tree
+neo click @14               # Click a menu item
+
+# Or connect to an already-running Electron app
+neo connect --electron slack
+
+# Inject Neo's capture script into any CDP target
+neo inject --persist        # Survives page navigation
+neo inject --tab slack      # Target specific tab
+```
+
+Sessions are saved automatically. Switch between them with `--session`:
+
+```bash
+neo --session vscode snapshot
+neo --session chrome api x.com HomeTimeline
+```
+
+### UI Automation (v2)
+
+Neo v2 adds a full UI interaction layer built on the accessibility tree — no screenshots, no coordinates, no pixel-matching:
+
+```bash
+# 1. Take a snapshot — each interactive element gets a @ref
+neo snapshot
+#  @1  button "Sign in"
+#  @2  textbox "Search"
+#  @3  link "Pricing"
+
+# 2. Interact by @ref
+neo click @1
+neo fill @2 "AI agents"
+neo press Enter
+neo screenshot results.png --full
+```
+
+This gives AI agents a fast, semantic way to interact with any UI. Combine with API capture for a dual-channel approach: use APIs when they exist, fall back to UI when they don't.
 
 The bridge creates a persistent WebSocket channel between the extension and CLI. The extension auto-connects to `ws://127.0.0.1:9234` and streams every capture in real-time. In interactive mode, you can query the extension directly: `ping`, `status`, `capture.count`, `capture.list`, `capture.domains`, `capture.search`, `capture.clear`.
 
@@ -135,16 +180,14 @@ The bridge creates a persistent WebSocket channel between the extension and CLI.
 
 ```
 ┌─────────────────────────────────────┐
-│  Chrome Extension (Manifest V3)      │
+│  Chrome / Electron App (CDP)         │
 │                                      │
 │  inject/interceptor.ts               │
 │    ├─ Monkey-patches fetch & XHR     │
-│    ├─ Intercepts WebSocket traffic   │
-│    ├─ Intercepts EventSource/SSE     │
+│    ├─ Intercepts WebSocket/SSE       │
 │    ├─ Tracks DOM triggers (click →   │
 │    │   API correlation)              │
-│    ├─ Records full request/response  │
-│    └─ Correlates with DOM events     │
+│    └─ Records full request/response  │
 │                                      │
 │  content/index.ts                    │
 │    └─ Bridges page ↔ extension       │
@@ -153,27 +196,38 @@ The bridge creates a persistent WebSocket channel between the extension and CLI.
 │    ├─ Persists to IndexedDB (Dexie)  │
 │    ├─ Per-domain cap (500 entries)   │
 │    └─ WebSocket Bridge client        │
-│       (auto-connects to bridge)      │
 │                                      │
 └──────────────┬──────────────────────┘
-               │ Chrome DevTools Protocol (port 9222)
+               │ Chrome DevTools Protocol
 ┌──────────────┴──────────────────────┐
-│  CLI: tools/neo.cjs (Node.js)        │
-│  ├─ neo capture → read/export/search  │
-│  ├─ neo schema  → analyze → schema   │
+│  CLI: neo (Node.js)                  │
+│                                      │
+│  Layer 1: API Capture & Replay       │
+│  ├─ neo capture → traffic management │
+│  ├─ neo schema  → API discovery      │
 │  ├─ neo exec    → execute in browser │
 │  ├─ neo api     → smart schema call  │
-│  ├─ neo flows   → sequence analysis  │
 │  ├─ neo replay  → re-run captured    │
-│  ├─ neo eval    → run JS in tab      │
-│  └─ neo read    → extract page text  │
+│  └─ neo flows/deps → pattern analysis│
+│                                      │
+│  Layer 2: UI Automation (v2)         │
+│  ├─ neo snapshot → a11y tree + @refs │
+│  ├─ neo click/fill/type/press/hover  │
+│  ├─ neo scroll/select/screenshot     │
+│  └─ neo get/wait                     │
+│                                      │
+│  Session Management                  │
+│  ├─ neo connect/launch/discover      │
+│  ├─ neo tab → target switching       │
+│  └─ neo inject → script injection    │
+│                                      │
 └──────────────┬──────────────────────┘
                │
 ┌──────────────┴──────────────────────┐
 │  AI Agent (OpenClaw / any LLM)       │
-│  ├─ Reads schema to understand APIs  │
-│  ├─ Plans multi-step operations      │
-│  └─ Calls neo-exec to act            │
+│  ├─ API-first: schema → exec/api     │
+│  ├─ UI fallback: snapshot → click    │
+│  └─ Dual-channel automation          │
 └──────────────────────────────────────┘
 ```
 
@@ -279,20 +333,23 @@ Neo is a developer tool that trades privacy surface for capability. Use it knowi
 - [x] Import/export: cross-device capture migration
 - [x] Smart API call: `neo api` with schema lookup + auto-auth
 - [x] Flow analysis: `neo flows` discovers API call sequences
-- [x] Dependency chains: `neo deps` finds response→request data flow between endpoints
+- [x] Dependency chains: `neo deps` finds response→request data flow
 - [x] Schema versioning with diff detection and history
 - [x] Diagnostics: `neo doctor` for setup verification
-- [x] Body field variability: schema tracks constant vs variable request fields
 - [x] Pure function extraction + 73 unit tests + CI
-- [x] Agent skill export: `neo export-skill` generates SKILL.md-ready API reference
+- [x] Agent skill export: `neo export-skill` generates SKILL.md
 - [x] Mock server: `neo mock` generates local HTTP server from schema
 - [x] HAR 1.2 export format for Postman/Charles/devtools interop
 - [x] OpenAPI 3.0 spec generation from captured schemas
 - [x] Batch schema generation (`--all`)
-- [x] Semantic endpoint labeling in `neo label` (heuristic + prompt-first workflow)
-- [x] Multi-step workflow discovery and execution in `neo workflow`
-- [ ] Dual-channel: Neo API-first → browser-use fallback
-- [x] Multi-step workflow replay
+- [x] Semantic endpoint labeling (`neo label`)
+- [x] Multi-step workflow discovery and execution (`neo workflow`)
+- [x] Session management: `neo connect`, `neo sessions`, `--session` flag
+- [x] Electron support: `neo launch`, `neo connect --electron`
+- [x] Tab management: `neo tab` list/switch targets
+- [x] Script injection: `neo inject` with `--persist` and `--tab`
+- [x] **v2 UI layer**: `snapshot`, `click`, `fill`, `type`, `press`, `hover`, `scroll`, `select`, `screenshot`, `get`, `wait`
+- [ ] Dual-channel: Neo API-first → UI fallback (automatic)
 
 ## License
 
