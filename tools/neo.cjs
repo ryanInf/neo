@@ -23,6 +23,8 @@
 //   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
 //   neo discover                            Discover reachable CDP targets on localhost ports
 //   neo sessions                            List saved active sessions
+//   neo tab                                 List CDP targets in the active session
+//   neo tab <index> | neo tab --url <pat>  Switch active tab target
 //   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
 //   neo click @ref [--new-tab]              Click element by @ref
 //   neo fill @ref "text"                     Clear then fill element by @ref
@@ -1719,6 +1721,39 @@ async function connectToCdpPort(port, sessionName = DEFAULT_SESSION_NAME) {
   };
 }
 
+function parseTabTargets(targets) {
+  const source = Array.isArray(targets) ? targets : [];
+  return source.map((target, index) => {
+    const item = target && typeof target === 'object' ? target : {};
+    const id = item.id || item.targetId || '';
+    return {
+      index,
+      type: String(item.type || 'unknown'),
+      id: String(id || ''),
+      title: String(item.title || ''),
+      url: String(item.url || ''),
+      webSocketDebuggerUrl: String(item.webSocketDebuggerUrl || ''),
+    };
+  });
+}
+
+function getSessionCdpUrl(sessionName = DEFAULT_SESSION_NAME) {
+  const session = getSession(sessionName);
+  if (session && session.cdpUrl) return session.cdpUrl;
+  return CDP_URL;
+}
+
+function updateSessionTab(sessionName, cdpUrl, target) {
+  const existing = getSession(sessionName) || {};
+  setSession(sessionName, {
+    ...existing,
+    cdpUrl,
+    pageWsUrl: target.webSocketDebuggerUrl,
+    tabId: target.id,
+    refs: {},
+  });
+}
+
 // ─── Commands ───────────────────────────────────────────────────
 
 const commands = {};
@@ -1865,6 +1900,56 @@ commands.sessions = function() {
     const tab = data.tabId || '(no-tab)';
     console.log(`${name} ${data.cdpUrl} ${tab}`);
   }
+};
+
+// neo tab / neo tab <index> / neo tab --url <pattern>
+commands.tab = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const cdpUrl = getSessionCdpUrl(sessionName);
+  const targets = parseTabTargets(await fetchJsonOrThrow(`${cdpUrl}/json/list`));
+  if (!targets.length) {
+    console.log('No CDP targets found');
+    return;
+  }
+
+  const urlPattern = flags.url === undefined ? null : flags.url;
+  if (urlPattern === true || positional.length > 1 || (urlPattern !== null && positional.length > 0)) {
+    console.error('Usage: neo tab | neo tab <index> | neo tab --url <pattern>');
+    process.exit(1);
+  }
+
+  if (urlPattern === null && positional.length === 0) {
+    for (const target of targets) {
+      const title = target.title || '(untitled)';
+      const id = target.id || '(no-id)';
+      console.log(`[${target.index}] ${target.type} ${id} ${title}`);
+      console.log(`    ${target.url || '(no-url)'}`);
+    }
+    return;
+  }
+
+  let selected = null;
+  if (urlPattern !== null) {
+    const pattern = String(urlPattern);
+    selected = targets.find(target => target.url.includes(pattern)) || null;
+    if (!selected) {
+      throw new Error(`No tab matching URL pattern: ${pattern}`);
+    }
+  } else {
+    const index = parseInt(String(positional[0]), 10);
+    if (!Number.isInteger(index) || index < 0 || index >= targets.length) {
+      throw new Error(`Invalid tab index: ${positional[0]}`);
+    }
+    selected = targets[index];
+  }
+
+  if (!selected.webSocketDebuggerUrl) {
+    throw new Error(`Target ${selected.id || selected.index} does not expose webSocketDebuggerUrl`);
+  }
+
+  updateSessionTab(sessionName, cdpUrl, selected);
+  console.log(`Switched to tab ${selected.index}: ${selected.id || '(no-id)'} ${selected.title || '(untitled)'}`);
 };
 
 // neo snapshot [-i] [-C] [--json] [--selector css]
@@ -4836,6 +4921,8 @@ Commands:
   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
   neo discover                            Discover reachable CDP endpoints on localhost
   neo sessions                            List saved active sessions
+  neo tab                                 List CDP targets in the active session
+  neo tab <index> | neo tab --url <pat>  Switch active tab target
   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
   neo click @ref [--new-tab]              Click element by @ref
   neo fill @ref "text"                     Clear then fill element by @ref

@@ -294,6 +294,22 @@ function findElectronDebugPort(appName, deps = {}) {
   }
 }
 
+function parseTabTargets(targets) {
+  const source = Array.isArray(targets) ? targets : [];
+  return source.map((target, index) => {
+    const item = target && typeof target === 'object' ? target : {};
+    const id = item.id || item.targetId || '';
+    return {
+      index,
+      type: String(item.type || 'unknown'),
+      id: String(id || ''),
+      title: String(item.title || ''),
+      url: String(item.url || ''),
+      webSocketDebuggerUrl: String(item.webSocketDebuggerUrl || ''),
+    };
+  });
+}
+
 function resetSessionFile() {
   try { fs.unlinkSync(SESSION_FILE); } catch {}
 }
@@ -702,6 +718,55 @@ test('findElectronDebugPort returns null when no debug flag is found', () => {
     execSync: () => 'fourier  123  1.2  feishu --flag without-port',
   });
   assert.strictEqual(port, null);
+});
+
+console.log('\nTab list parsing:');
+test('parseTabTargets normalizes target fields and preserves order', () => {
+  const targets = parseTabTargets([
+    {
+      type: 'page',
+      id: 'tab-1',
+      title: 'Home',
+      url: 'https://example.com',
+      webSocketDebuggerUrl: 'ws://localhost:9222/devtools/page/tab-1',
+    },
+    {
+      type: 'service_worker',
+      targetId: 'worker-1',
+      title: '',
+      url: 'chrome-extension://id/bg.js',
+    },
+  ]);
+  assert.strictEqual(targets.length, 2);
+  assert.deepStrictEqual(targets[0], {
+    index: 0,
+    type: 'page',
+    id: 'tab-1',
+    title: 'Home',
+    url: 'https://example.com',
+    webSocketDebuggerUrl: 'ws://localhost:9222/devtools/page/tab-1',
+  });
+  assert.deepStrictEqual(targets[1], {
+    index: 1,
+    type: 'service_worker',
+    id: 'worker-1',
+    title: '',
+    url: 'chrome-extension://id/bg.js',
+    webSocketDebuggerUrl: '',
+  });
+});
+
+test('parseTabTargets handles invalid input defensively', () => {
+  assert.deepStrictEqual(parseTabTargets(null), []);
+  const one = parseTabTargets([null])[0];
+  assert.deepStrictEqual(one, {
+    index: 0,
+    type: 'unknown',
+    id: '',
+    title: '',
+    url: '',
+    webSocketDebuggerUrl: '',
+  });
 });
 
 console.log('\nsession store:');
