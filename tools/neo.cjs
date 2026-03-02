@@ -29,6 +29,7 @@
 //   neo hover @ref                           Hover over element by @ref
 //   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
 //   neo select @ref "value"                  Select option value by @ref
+//   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1892,6 +1893,53 @@ commands.select = async function(args, context = {}) {
   }
 
   console.log(`Selected ${ref} = "${payload.value}"`);
+};
+
+// neo screenshot [path] [--full] [--annotate]
+commands.screenshot = async function(args, context = {}) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 1) {
+    console.error('Usage: neo screenshot [path] [--full] [--annotate]');
+    process.exit(1);
+  }
+
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const pageWsUrl = getSessionPageWsUrl(sessionName);
+  const outputPath = positional[0]
+    ? path.resolve(positional[0])
+    : `/tmp/neo-screenshot-${Date.now()}.png`;
+  const screenshotParams = {
+    format: 'png',
+  };
+
+  if (flags.full !== undefined) {
+    const layout = await cdpSend(pageWsUrl, 'Page.getLayoutMetrics');
+    const contentSize = (layout && layout.contentSize) || (layout && layout.cssContentSize) || null;
+    if (contentSize && Number.isFinite(contentSize.width) && Number.isFinite(contentSize.height)) {
+      screenshotParams.captureBeyondViewport = true;
+      screenshotParams.clip = {
+        x: 0,
+        y: 0,
+        width: Math.max(1, Math.ceil(contentSize.width)),
+        height: Math.max(1, Math.ceil(contentSize.height)),
+        scale: 1,
+      };
+    } else {
+      screenshotParams.captureBeyondViewport = true;
+    }
+  }
+
+  const result = await cdpSend(pageWsUrl, 'Page.captureScreenshot', screenshotParams);
+  if (!result || !result.data) {
+    throw new Error('Failed to capture screenshot');
+  }
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, Buffer.from(result.data, 'base64'));
+  if (flags.annotate !== undefined) {
+    console.error('TODO: screenshot --annotate is not implemented yet');
+  }
+  console.log(outputPath);
 };
 
 // neo label <domain> [--dry-run]
@@ -4443,6 +4491,7 @@ Commands:
   neo hover @ref                           Hover over element by @ref
   neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
   neo select @ref "value"                  Select option value by @ref
+  neo screenshot [path] [--full] [--annotate] Capture screenshot to file
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
