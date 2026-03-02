@@ -94,6 +94,63 @@ async function findTab(pattern) {
   return pages[0];
 }
 
+function cdpSend(pageWsUrl, method, params = {}, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!pageWsUrl) {
+      reject(new Error('Missing page WebSocket URL'));
+      return;
+    }
+    if (!method) {
+      reject(new Error('Missing CDP method'));
+      return;
+    }
+
+    const ws = new WebSocket(pageWsUrl);
+    const id = 1;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error(`CDP timeout: ${method}`));
+    }, timeout);
+
+    function done(err, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (err) reject(err);
+      else resolve(result);
+    }
+
+    ws.on('open', () => {
+      const message = { id, method };
+      if (params && Object.keys(params).length > 0) {
+        message.params = params;
+      }
+      ws.send(JSON.stringify(message));
+    });
+
+    ws.on('message', (raw) => {
+      let msg;
+      try { msg = JSON.parse(raw.toString()); }
+      catch { return; }
+      if (msg.id !== id) return;
+      if (msg.error) {
+        done(new Error(`CDP ${method} failed: ${msg.error.message || 'Unknown error'}`));
+        return;
+      }
+      done(null, msg.result);
+    });
+
+    ws.on('error', (err) => done(err));
+    ws.on('close', () => {
+      if (!settled) done(new Error(`CDP socket closed before response: ${method}`));
+    });
+  });
+}
+
 function cdpEval(wsUrl, expression, timeout = 30000) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
