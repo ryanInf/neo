@@ -56,6 +56,7 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'cl
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const DEFAULT_SESSION_NAME = '__default__';
+const EXTENSION_NOT_FOUND_MESSAGE = 'Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222';
 const ELECTRON_APPS = Object.freeze({
   slack: Object.freeze(['/usr/bin/slack', 'slack']),
   code: Object.freeze(['/usr/bin/code', 'code']),
@@ -101,6 +102,13 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   sessions[name] = (!data || typeof data !== 'object' || Array.isArray(data)) ? {} : data;
   saveSessions(sessions);
   return sessions[name];
+}
+
+function hasActiveSession(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  return !!(session && typeof session.pageWsUrl === 'string' && session.pageWsUrl.trim());
 }
 
 function shellEscape(value) {
@@ -212,16 +220,189 @@ async function waitForCdpPort(port, timeoutMs = 10000, intervalMs = 250, deps = 
 
 // ─── CDP Helpers ────────────────────────────────────────────────
 
-async function findExtensionWs() {
-  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
-  // Must match the service_worker, not the extensions page
-  const sw = tabs.find(t => t.type === 'service_worker' && t.url.includes(NEO_EXTENSION_ID));
-  if (!sw) throw new Error('Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222');
-  return sw.webSocketDebuggerUrl;
+async function findExtensionWs(deps = {}) {
+  const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
+  const cdpUrl = deps.cdpUrl || CDP_URL;
+  try {
+    const resp = await fetchFn(`${cdpUrl}/json/list`);
+    if (!resp || !resp.ok) return null;
+    const tabs = await resp.json();
+    // Must match the service_worker, not the extensions page
+    const sw = (Array.isArray(tabs) ? tabs : [])
+      .find(t => t.type === 'service_worker' && String(t.url || '').includes(NEO_EXTENSION_ID));
+    if (!sw || !sw.webSocketDebuggerUrl) return null;
+    return sw.webSocketDebuggerUrl;
+  } catch {
+    return null;
+  }
 }
 
-async function findTab(pattern) {
-  const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+async function requireExtensionWs() {
+  const wsUrl = await findExtensionWs();
+  if (!wsUrl) {
+    throw new Error(EXTENSION_NOT_FOUND_MESSAGE);
+  }
+  return wsUrl;
+}
+
+async function isSessionMode(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const findExtensionWsFn = typeof deps.findExtensionWs === 'function' ? deps.findExtensionWs : findExtensionWs;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    return false;
+  }
+
+  if (deps.extensionWsUrl !== undefined) {
+    return !deps.extensionWsUrl;
+  }
+
+  const cdpUrl = deps.cdpUrl || session.cdpUrl || CDP_URL;
+  const extensionWsUrl = await findExtensionWsFn({ cdpUrl });
+  return !extensionWsUrl;
+}
+
+function applySessionCaptureFilters(captures, filters = {}) {
+  if (!Array.isArray(captures)) return [];
+  const config = (filters && typeof filters === 'object' && !Array.isArray(filters)) ? filters : {};
+  let rows = captures.slice();
+
+  if (config.domain) {
+    const expected = String(config.domain);
+    rows = rows.filter(item => String(item && item.domain || '') === expected);
+  }
+  if (config.method) {
+    const expectedMethod = String(config.method).toUpperCase();
+    rows = rows.filter(item => String(item && item.method || '').toUpperCase() === expectedMethod);
+  }
+  if (config.status !== undefined && config.status !== null && config.status !== '') {
+    const expectedStatus = Number(config.status);
+    rows = rows.filter(item => Number(item && item.responseStatus) === expectedStatus);
+  }
+  if (config.query) {
+    const needle = String(config.query);
+    rows = rows.filter((item) => {
+      const url = String(item && item.url || '');
+      const domain = String(item && item.domain || '');
+      return url.includes(needle) || domain.includes(needle);
+    });
+  }
+  if (config.id) {
+    const targetId = String(config.id);
+    rows = rows.filter(item => String(item && item.id || '') === targetId);
+  }
+  if (config.idPrefix) {
+    const targetPrefix = String(config.idPrefix);
+    rows = rows.filter(item => String(item && item.id || '').startsWith(targetPrefix));
+  }
+  if (config.since) {
+    const sinceTs = Number(config.since) || 0;
+    rows = rows.filter(item => (Number(item && item.timestamp) || 0) >= sinceTs);
+  }
+  if (config.sort === 'timestamp-desc') {
+    rows.sort((a, b) => (Number(b && b.timestamp) || 0) - (Number(a && a.timestamp) || 0));
+  }
+
+  const limit = Number(config.limit);
+  if (Number.isFinite(limit) && limit > 0) {
+    rows = rows.slice(0, limit);
+  }
+
+  return rows;
+}
+
+async function getSessionCaptures(sessionName = DEFAULT_SESSION_NAME, filters = {}, deps = {}) {
+  let resolvedFilters = filters;
+  let resolvedDeps = deps;
+  if (
+    resolvedFilters
+    && typeof resolvedFilters === 'object'
+    && !Array.isArray(resolvedFilters)
+    && (typeof resolvedFilters.getSession === 'function' || typeof resolvedFilters.cdpSend === 'function')
+  ) {
+    resolvedDeps = resolvedFilters;
+    resolvedFilters = {};
+  }
+
+  const getSessionFn = typeof resolvedDeps.getSession === 'function' ? resolvedDeps.getSession : getSession;
+  const sendFn = typeof resolvedDeps.cdpSend === 'function' ? resolvedDeps.cdpSend : cdpSend;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    return [];
+  }
+
+  const evaluated = await sendFn(session.pageWsUrl, 'Runtime.evaluate', {
+    expression: `(function() {
+      try {
+        var rows = Array.isArray(globalThis.__NEO_CAPTURES__) ? globalThis.__NEO_CAPTURES__ : [];
+        if (rows.length > 500) rows = rows.slice(rows.length - 500);
+        return rows;
+      } catch (e) {
+        return [];
+      }
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+
+  const value = evaluated && evaluated.result ? evaluated.result.value : [];
+  const rows = Array.isArray(value) ? value.filter(item => item && typeof item === 'object') : [];
+  return applySessionCaptureFilters(rows, resolvedFilters);
+}
+
+async function clearSessionCaptures(sessionName = DEFAULT_SESSION_NAME, domain = null, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : cdpSend;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    return { deleted: 0, total: 0 };
+  }
+
+  const evaluated = await sendFn(session.pageWsUrl, 'Runtime.evaluate', {
+    expression: `(function() {
+      try {
+        var rows = Array.isArray(globalThis.__NEO_CAPTURES__) ? globalThis.__NEO_CAPTURES__ : [];
+        var domain = ${domain ? JSON.stringify(domain) : 'null'};
+        if (!domain) {
+          var deletedAll = rows.length;
+          globalThis.__NEO_CAPTURES__ = [];
+          return { deleted: deletedAll, total: 0 };
+        }
+        var next = [];
+        var deleted = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var item = rows[i];
+          if (item && item.domain === domain) deleted++;
+          else next.push(item);
+        }
+        if (next.length > 500) next = next.slice(next.length - 500);
+        globalThis.__NEO_CAPTURES__ = next;
+        return { deleted: deleted, total: next.length };
+      } catch (e) {
+        return { deleted: 0, total: 0 };
+      }
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+
+  const value = evaluated && evaluated.result ? evaluated.result.value : null;
+  if (!value || typeof value !== 'object') {
+    return { deleted: 0, total: 0 };
+  }
+  return {
+    deleted: Number(value.deleted) || 0,
+    total: Number(value.total) || 0,
+  };
+}
+
+async function findTab(pattern, deps = {}) {
+  const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
+  const cdpUrl = deps.cdpUrl || CDP_URL;
+  const tabs = await (await fetchFn(`${cdpUrl}/json/list`)).json();
   if (pattern) {
     const tab = tabs.find(t => t.type === 'page' && t.url.includes(pattern));
     if (!tab) throw new Error(`No tab matching "${pattern}"`);
@@ -978,6 +1159,244 @@ function capitalize(text) {
 
 function normalizeMethod(method) {
   return String(method || '').toUpperCase();
+}
+
+function extractSchemaKeys(obj, maxDepth) {
+  if (maxDepth <= 0 || obj === null || typeof obj !== 'object') {
+    return typeof obj;
+  }
+  if (Array.isArray(obj)) {
+    return obj.length > 0 ? [extractSchemaKeys(obj[0], maxDepth - 1)] : [];
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === null) {
+      result[key] = 'null';
+    } else if (typeof value === 'object') {
+      result[key] = extractSchemaKeys(value, maxDepth - 1);
+    } else {
+      result[key] = typeof value;
+    }
+  }
+  return result;
+}
+
+function normalizeSchemaPath(pathname) {
+  const source = String(pathname || '/');
+  return source.split('/').map((segment) => {
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return ':uuid';
+    if (/^\d{4,}$/.test(segment)) return ':id';
+    if (/^[a-zA-Z0-9_-]{15,30}$/.test(segment) && /[a-z]/.test(segment) && /[A-Z]/.test(segment)) {
+      let transitions = 0;
+      for (let i = 1; i < segment.length; i++) {
+        if (/\d/.test(segment[i - 1]) !== /\d/.test(segment[i])) transitions++;
+      }
+      if (transitions >= 3) return ':hash';
+      if (!/[a-z]{4,}/.test(segment)) return ':hash';
+    }
+    return segment;
+  }).join('/');
+}
+
+function parseCaptureObjectBody(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return raw;
+  }
+  return null;
+}
+
+function firstHeaderValue(headers, name) {
+  const target = String(name || '').toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === target) return String(value || '');
+  }
+  return '';
+}
+
+function inferSchemaCategory(method, pathText) {
+  const m = normalizeMethod(method);
+  const p = String(pathText || '').toLowerCase();
+  if (m.startsWith('WS_') || m.startsWith('SSE_')) return 'realtime';
+  if (p.includes('auth') || p.includes('login') || p.includes('token') || p.includes('oauth') || p.includes('session')) return 'auth';
+  if (p.includes('search') || p.includes('query')) return 'search';
+  if (p.includes('/log_') || p.includes('/log/') || p.endsWith('/log') || p.includes('track') || p.includes('/event') || p.includes('beacon') || p.includes('metric') || p.includes('telemetry')) return 'telemetry';
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return 'read';
+  if (m === 'POST' || m === 'PUT' || m === 'PATCH' || m === 'DELETE') return 'write';
+  return undefined;
+}
+
+function buildSchemaFromCaptures(domain, captures) {
+  const rows = Array.isArray(captures) ? captures : [];
+  const endpoints = new Map();
+  const authKeys = [
+    'authorization', 'x-csrf-token', 'x-twitter-auth-type',
+    'x-requested-with', 'x-github-client-version', 'x-client-transaction-id',
+    'x-twitter-active-user', 'x-twitter-client-language', 'x-fetch-nonce',
+    'github-verified-fetch', 'x-api-key', 'api-key',
+  ];
+  let total = 0;
+
+  for (const capture of rows) {
+    if (!capture || capture.domain !== domain) continue;
+    total++;
+
+    let url;
+    try {
+      url = new URL(capture.url);
+    } catch {
+      continue;
+    }
+    const method = normalizeMethod(capture.method || 'GET');
+    const pathText = normalizeSchemaPath(url.pathname);
+    const key = `${method} ${pathText}`;
+
+    if (!endpoints.has(key)) {
+      endpoints.set(key, {
+        method,
+        path: pathText,
+        queryParams: new Set(),
+        statusCodes: {},
+        headers: new Set(),
+        durations: [],
+        count: 0,
+        responseType: null,
+        bodyKeys: null,
+        bodySamples: [],
+        responseKeys: null,
+        triggers: new Map(),
+        sources: {},
+      });
+    }
+
+    const endpoint = endpoints.get(key);
+    endpoint.count++;
+    const source = capture.source || 'fetch';
+    endpoint.sources[source] = (endpoint.sources[source] || 0) + 1;
+    for (const queryKey of url.searchParams.keys()) {
+      endpoint.queryParams.add(queryKey);
+    }
+    const statusCode = capture.responseStatus;
+    endpoint.statusCodes[statusCode] = (endpoint.statusCodes[statusCode] || 0) + 1;
+
+    const duration = Number(capture.duration);
+    if (Number.isFinite(duration) && duration > 0) {
+      endpoint.durations.push(duration);
+    }
+
+    if (capture.requestBody && endpoint.bodySamples.length < 5) {
+      const bodyObj = parseCaptureObjectBody(capture.requestBody);
+      if (bodyObj) {
+        if (!endpoint.bodyKeys) endpoint.bodyKeys = extractSchemaKeys(bodyObj, 2);
+        const sample = {};
+        for (const [field, value] of Object.entries(bodyObj)) {
+          if (value === null || value === undefined) sample[field] = null;
+          else if (typeof value === 'object') {
+            try { sample[field] = JSON.stringify(value); }
+            catch { sample[field] = '[unserializable]'; }
+          } else sample[field] = String(value);
+        }
+        endpoint.bodySamples.push(sample);
+      }
+    }
+
+    if (!endpoint.responseKeys && statusCode >= 200 && statusCode < 300 && capture.responseBody) {
+      const responseObj = parseCaptureObjectBody(capture.responseBody);
+      if (responseObj) {
+        endpoint.responseKeys = extractSchemaKeys(responseObj, 2);
+      }
+    }
+
+    for (const headerName of Object.keys(capture.requestHeaders || {})) {
+      const lower = headerName.toLowerCase();
+      if (authKeys.includes(lower) || lower.startsWith('x-csrf') || lower.startsWith('x-api')) {
+        endpoint.headers.add(headerName);
+      }
+    }
+
+    const contentType = firstHeaderValue(capture.responseHeaders || {}, 'content-type').toLowerCase();
+    if (contentType.includes('json')) endpoint.responseType = 'json';
+    else if (contentType.includes('html')) endpoint.responseType = 'html';
+    else if (contentType.includes('text')) endpoint.responseType = 'text';
+
+    if (capture.trigger && capture.trigger.selector) {
+      const eventName = capture.trigger.event;
+      const selector = capture.trigger.selector;
+      const triggerKey = `${eventName} ${selector}`;
+      if (!endpoint.triggers.has(triggerKey)) {
+        endpoint.triggers.set(triggerKey, {
+          event: eventName,
+          selector,
+          text: capture.trigger.text,
+          count: 0,
+        });
+      }
+      endpoint.triggers.get(triggerKey).count++;
+    }
+  }
+
+  const endpointList = [...endpoints.values()]
+    .sort((a, b) => b.count - a.count)
+    .map((endpoint) => {
+      const avgDuration = endpoint.durations.length
+        ? `${Math.round(endpoint.durations.reduce((sum, value) => sum + value, 0) / endpoint.durations.length)}ms`
+        : null;
+
+      let bodyFieldVariability;
+      if (endpoint.bodySamples.length >= 2) {
+        const allFields = new Set();
+        for (const sample of endpoint.bodySamples) {
+          for (const field of Object.keys(sample)) allFields.add(field);
+        }
+        const variability = {};
+        for (const field of allFields) {
+          const values = new Set();
+          for (const sample of endpoint.bodySamples) {
+            if (sample[field] !== undefined) values.add(sample[field]);
+          }
+          variability[field] = values.size <= 1 ? 'constant' : 'variable';
+        }
+        bodyFieldVariability = Object.keys(variability).length ? variability : undefined;
+      }
+
+      const sources = Object.keys(endpoint.sources);
+      const sourceValue = sources.length === 1 ? sources[0] : endpoint.sources;
+
+      return {
+        method: endpoint.method,
+        path: endpoint.path,
+        callCount: endpoint.count,
+        queryParams: [...endpoint.queryParams],
+        statusCodes: endpoint.statusCodes,
+        avgDuration,
+        authHeaders: endpoint.headers.size ? [...endpoint.headers] : undefined,
+        responseType: endpoint.responseType,
+        source: sourceValue,
+        requestBodyStructure: endpoint.bodyKeys || undefined,
+        bodyFieldVariability,
+        responseBodyStructure: endpoint.responseKeys || undefined,
+        triggers: endpoint.triggers.size
+          ? [...endpoint.triggers.values()].sort((a, b) => b.count - a.count).slice(0, 5)
+          : undefined,
+        category: inferSchemaCategory(endpoint.method, endpoint.path),
+      };
+    });
+
+  return {
+    domain,
+    generatedAt: new Date().toISOString(),
+    totalCaptures: total,
+    uniqueEndpoints: endpointList.length,
+    endpoints: endpointList,
+  };
 }
 
 function endpointKey(method, path) {
@@ -1808,6 +2227,19 @@ function buildInjectScript(sourceCode) {
     if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
       globalThis.__NEO_CAPTURES__ = [];
     }
+    if (!globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__) {
+      globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__ = function(event) {
+        try {
+          var data = event && event.data;
+          if (!data || data.type !== 'neo:capture_request' || !data.payload) return;
+          globalThis.__NEO_CAPTURES__.push(data.payload);
+          if (globalThis.__NEO_CAPTURES__.length > 500) {
+            globalThis.__NEO_CAPTURES__.shift();
+          }
+        } catch {}
+      };
+      window.addEventListener('message', globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__);
+    }
     if (typeof globalThis.__neoMiniReporter !== 'function') {
       globalThis.__neoMiniReporter = function(event, payload) {
         try {
@@ -2526,7 +2958,7 @@ commands.label = async function(args) {
 
 // neo status
 commands.status = async function() {
-  const wsUrl = await findExtensionWs();
+  const wsUrl = await requireExtensionWs();
   const count = await cdpEval(wsUrl, dbEval(`
     store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
   `));
@@ -2546,33 +2978,62 @@ commands.status = async function() {
 };
 
 // neo capture <action>
-commands.capture = async function(args) {
+commands.capture = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
-  const wsUrl = await findExtensionWs();
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const cdpUrl = getSessionCdpUrl(sessionName);
+  const extensionWsUrl = await findExtensionWs({ cdpUrl });
+  const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
+
+  function ensureCaptureSource() {
+    if (extensionWsUrl || sessionMode) return;
+    throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
+  }
 
   switch (action) {
     case 'count': {
-      const r = await cdpEval(wsUrl, dbEval(`
-        store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
-      `));
-      console.log(r);
+      if (extensionWsUrl) {
+        const r = await cdpEval(extensionWsUrl, dbEval(`
+          store.count().onsuccess = function(e) { resolve(String(e.target.result)); };
+        `));
+        console.log(r);
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        console.log(String(captures.length));
+      }
       break;
     }
 
     case 'domains': {
-      const r = await cdpEval(wsUrl, dbEval(`
-        var map = {};
-        store.openCursor().onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) { map[c.value.domain] = (map[c.value.domain] || 0) + 1; c.continue(); }
-          else {
-            var sorted = Object.entries(map).sort(function(a,b){ return b[1]-a[1]; });
-            resolve(sorted.map(function(d){ return d[0] + ": " + d[1]; }).join("\\n"));
-          }
-        };
-      `));
-      console.log(r || '(no captures)');
+      if (extensionWsUrl) {
+        const r = await cdpEval(extensionWsUrl, dbEval(`
+          var map = {};
+          store.openCursor().onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) { map[c.value.domain] = (map[c.value.domain] || 0) + 1; c.continue(); }
+            else {
+              var sorted = Object.entries(map).sort(function(a,b){ return b[1]-a[1]; });
+              resolve(sorted.map(function(d){ return d[0] + ": " + d[1]; }).join("\\n"));
+            }
+          };
+        `));
+        console.log(r || '(no captures)');
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        const counts = {};
+        for (const capture of captures) {
+          const domain = capture && capture.domain ? String(capture.domain) : '';
+          if (!domain) continue;
+          counts[domain] = (counts[domain] || 0) + 1;
+        }
+        const lines = Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([domain, count]) => `${domain}: ${count}`);
+        console.log(lines.join('\n') || '(no captures)');
+      }
       break;
     }
 
@@ -2580,52 +3041,88 @@ commands.capture = async function(args) {
       const domain = positional[1];
       const limit = parseInt(flags.limit) || 20;
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
-      const r = await cdpEval(wsUrl, dbEval(`
-        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, limit = ${limit}, since = ${since};
-        store.openCursor(null, "prev").onsuccess = function(e) {
-          var c = e.target.result;
-          if (c && rows.length < limit) {
-            var v = c.value;
-            if (since && v.timestamp < since) { resolve(rows.join("\\n")); return; }
-            if (!domain || v.domain === domain) {
-              var src = v.source === 'websocket' ? ' [ws]' : v.source === 'eventsource' ? ' [sse]' : '';
-              rows.push(v.id.slice(0,8) + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 90) + " (" + v.duration + "ms)" + src);
-            }
-            c.continue();
-          } else { resolve(rows.join("\\n")); }
-        };
-      `));
-      console.log(r || '(no captures)');
+      if (extensionWsUrl) {
+        const r = await cdpEval(extensionWsUrl, dbEval(`
+          var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, limit = ${limit}, since = ${since};
+          store.openCursor(null, "prev").onsuccess = function(e) {
+            var c = e.target.result;
+            if (c && rows.length < limit) {
+              var v = c.value;
+              if (since && v.timestamp < since) { resolve(rows.join("\\n")); return; }
+              if (!domain || v.domain === domain) {
+                var src = v.source === 'websocket' ? ' [ws]' : v.source === 'eventsource' ? ' [sse]' : '';
+                rows.push(v.id.slice(0,8) + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 90) + " (" + v.duration + "ms)" + src);
+              }
+              c.continue();
+            } else { resolve(rows.join("\\n")); }
+          };
+        `));
+        console.log(r || '(no captures)');
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        const rows = [];
+        const sorted = captures.slice().sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+        for (const capture of sorted) {
+          if (!capture || typeof capture !== 'object') continue;
+          if (rows.length >= limit) break;
+          if (since && (Number(capture.timestamp) || 0) < since) continue;
+          if (domain && capture.domain !== domain) continue;
+          const src = capture.source === 'websocket' ? ' [ws]' : capture.source === 'eventsource' ? ' [sse]' : '';
+          const shortId = String(capture.id || 'unknown').slice(0, 8);
+          const method = String(capture.method || 'GET');
+          const status = capture.responseStatus === undefined ? '?' : capture.responseStatus;
+          const url = String(capture.url || '').slice(0, 90);
+          const duration = Number(capture.duration) || 0;
+          rows.push(`${shortId}  ${method} ${status} ${url} (${duration}ms)${src}`);
+        }
+        console.log(rows.join('\n') || '(no captures)');
+      }
       break;
     }
 
     case 'detail': {
       const id = positional[1];
       if (!id) { console.error('Usage: neo capture detail <id> [--curl] [--neo]'); process.exit(1); }
-      const r = await cdpEval(wsUrl, dbEval(`
-        var targetId = ${JSON.stringify(id)};
-        // Try exact match first, then prefix match
-        store.get(targetId).onsuccess = function(e) {
-          if (e.target.result) {
-            var v = e.target.result;
-            if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
-              v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
-            resolve(JSON.stringify(v, null, 2));
-          } else {
-            // Prefix search
-            var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
-            store.openCursor(bound).onsuccess = function(e2) {
-              var c = e2.target.result;
-              if (c) {
-                var v = c.value;
-                if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
-                  v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
-                resolve(JSON.stringify(v, null, 2));
-              } else { resolve("Not found"); }
-            };
+      let r = 'Not found';
+      if (extensionWsUrl) {
+        r = await cdpEval(extensionWsUrl, dbEval(`
+          var targetId = ${JSON.stringify(id)};
+          // Try exact match first, then prefix match
+          store.get(targetId).onsuccess = function(e) {
+            if (e.target.result) {
+              var v = e.target.result;
+              if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
+                v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
+              resolve(JSON.stringify(v, null, 2));
+            } else {
+              // Prefix search
+              var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
+              store.openCursor(bound).onsuccess = function(e2) {
+                var c = e2.target.result;
+                if (c) {
+                  var v = c.value;
+                  if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 5000)
+                    v.responseBody = v.responseBody.slice(0, 5000) + "... [truncated]";
+                  resolve(JSON.stringify(v, null, 2));
+                } else { resolve("Not found"); }
+              };
+            }
+          };
+        `));
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        const exact = captures.find(item => item && String(item.id || '') === id);
+        const prefix = exact || captures.find(item => item && String(item.id || '').startsWith(id));
+        if (prefix) {
+          const copy = JSON.parse(JSON.stringify(prefix));
+          if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 5000) {
+            copy.responseBody = `${copy.responseBody.slice(0, 5000)}... [truncated]`;
           }
-        };
-      `));
+          r = JSON.stringify(copy, null, 2);
+        }
+      }
       if (r === 'Not found') { console.log(r); break; }
       
       if (flags.curl || flags.neo) {
@@ -2665,33 +3162,47 @@ commands.capture = async function(args) {
     case 'clear': {
       const domain = positional[1];
       if (domain) {
-        const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
-          var req = indexedDB.open("${DB_NAME}");
-          req.onsuccess = function() {
-            var db = req.result;
-            var tx = db.transaction("${STORE_NAME}", "readwrite");
-            var store = tx.objectStore("${STORE_NAME}");
-            var idx = store.index("domain");
-            var deleted = 0;
-            idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
-              var c = e.target.result;
-              if (c) { c.delete(); deleted++; c.continue(); }
-              else { resolve("Deleted " + deleted + " captures for ${domain}"); }
+        let r;
+        if (extensionWsUrl) {
+          r = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
+            var req = indexedDB.open("${DB_NAME}");
+            req.onsuccess = function() {
+              var db = req.result;
+              var tx = db.transaction("${STORE_NAME}", "readwrite");
+              var store = tx.objectStore("${STORE_NAME}");
+              var idx = store.index("domain");
+              var deleted = 0;
+              idx.openCursor(IDBKeyRange.only(${JSON.stringify(domain)})).onsuccess = function(e) {
+                var c = e.target.result;
+                if (c) { c.delete(); deleted++; c.continue(); }
+                else { resolve("Deleted " + deleted + " captures for ${domain}"); }
+              };
             };
-          };
-          setTimeout(function() { resolve("timeout"); }, 10000);
-        })`);
+            setTimeout(function() { resolve("timeout"); }, 10000);
+          })`);
+        } else {
+          ensureCaptureSource();
+          const cleared = await clearSessionCaptures(sessionName, domain);
+          r = `Deleted ${cleared.deleted} captures for ${domain}`;
+        }
         console.log(r);
       } else if (flags.all) {
-        const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
-          var req = indexedDB.open("${DB_NAME}");
-          req.onsuccess = function() {
-            var db = req.result;
-            var tx = db.transaction("${STORE_NAME}", "readwrite");
-            tx.objectStore("${STORE_NAME}").clear().onsuccess = function() { resolve("Cleared all captures"); };
-          };
-          setTimeout(function() { resolve("timeout"); }, 5000);
-        })`);
+        let r;
+        if (extensionWsUrl) {
+          r = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
+            var req = indexedDB.open("${DB_NAME}");
+            req.onsuccess = function() {
+              var db = req.result;
+              var tx = db.transaction("${STORE_NAME}", "readwrite");
+              tx.objectStore("${STORE_NAME}").clear().onsuccess = function() { resolve("Cleared all captures"); };
+            };
+            setTimeout(function() { resolve("timeout"); }, 5000);
+          })`);
+        } else {
+          ensureCaptureSource();
+          await clearSessionCaptures(sessionName, null);
+          r = 'Cleared all captures';
+        }
         console.log(r);
       } else {
         console.error('Usage: neo capture clear <domain>  or  neo capture clear --all');
@@ -2704,22 +3215,40 @@ commands.capture = async function(args) {
       const since = flags.since ? Date.now() - parseDuration(flags.since) : 0;
       const format = flags.format || 'json';
       const includeAuth = flags['include-auth'] !== undefined;
-      const r = await cdpEval(wsUrl, dbEval(`
-        var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
-        store.openCursor().onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            if (since && v.timestamp < since) { c.continue(); return; }
-            if (!domain || v.domain === domain) {
-              if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 2000)
-                v.responseBody = v.responseBody.slice(0, 2000) + "...[truncated]";
-              rows.push(v);
-            }
-            c.continue();
-          } else { resolve(JSON.stringify(rows)); }
-        };
-      `), 60000);
+      let r;
+      if (extensionWsUrl) {
+        r = await cdpEval(extensionWsUrl, dbEval(`
+          var rows = [], domain = ${domain ? JSON.stringify(domain) : 'null'}, since = ${since};
+          store.openCursor().onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) {
+              var v = c.value;
+              if (since && v.timestamp < since) { c.continue(); return; }
+              if (!domain || v.domain === domain) {
+                if (v.responseBody && typeof v.responseBody === "string" && v.responseBody.length > 2000)
+                  v.responseBody = v.responseBody.slice(0, 2000) + "...[truncated]";
+                rows.push(v);
+              }
+              c.continue();
+            } else { resolve(JSON.stringify(rows)); }
+          };
+        `), 60000);
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        const rows = [];
+        for (const capture of captures) {
+          if (!capture || typeof capture !== 'object') continue;
+          if (since && (Number(capture.timestamp) || 0) < since) continue;
+          if (domain && capture.domain !== domain) continue;
+          const copy = JSON.parse(JSON.stringify(capture));
+          if (copy.responseBody && typeof copy.responseBody === 'string' && copy.responseBody.length > 2000) {
+            copy.responseBody = `${copy.responseBody.slice(0, 2000)}...[truncated]`;
+          }
+          rows.push(copy);
+        }
+        r = JSON.stringify(rows);
+      }
       try {
         const parsed = JSON.parse(r);
         const liveHeadersByDomain = includeAuth
@@ -2788,28 +3317,48 @@ commands.capture = async function(args) {
     case 'stats': {
       const domain = positional[1];
       if (!domain) { console.error('Usage: neo capture stats <domain>'); process.exit(1); }
-      const r = await cdpEval(wsUrl, dbEval(`
-        var stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
-        var domain = ${JSON.stringify(domain)};
-        store.openCursor().onsuccess = function(e) {
-          var c = e.target.result;
-          if (c) {
-            var v = c.value;
-            if (v.domain === domain) {
-              stats.total++;
-              stats.methods[v.method] = (stats.methods[v.method] || 0) + 1;
-              stats.statuses[v.responseStatus] = (stats.statuses[v.responseStatus] || 0) + 1;
-              stats.sources[v.source || 'fetch'] = (stats.sources[v.source || 'fetch'] || 0) + 1;
-              stats.totalDuration += (v.duration || 0);
-              if (v.responseStatus >= 400 || v.responseStatus === 0) stats.errors++;
+      let stats;
+      if (extensionWsUrl) {
+        const r = await cdpEval(extensionWsUrl, dbEval(`
+          var stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
+          var domain = ${JSON.stringify(domain)};
+          store.openCursor().onsuccess = function(e) {
+            var c = e.target.result;
+            if (c) {
+              var v = c.value;
+              if (v.domain === domain) {
+                stats.total++;
+                stats.methods[v.method] = (stats.methods[v.method] || 0) + 1;
+                stats.statuses[v.responseStatus] = (stats.statuses[v.responseStatus] || 0) + 1;
+                stats.sources[v.source || 'fetch'] = (stats.sources[v.source || 'fetch'] || 0) + 1;
+                stats.totalDuration += (v.duration || 0);
+                if (v.responseStatus >= 400 || v.responseStatus === 0) stats.errors++;
+              }
+              c.continue();
+            } else {
+              resolve(JSON.stringify(stats));
             }
-            c.continue();
-          } else {
-            resolve(JSON.stringify(stats));
-          }
-        };
-      `));
-      const stats = JSON.parse(r);
+          };
+        `));
+        stats = JSON.parse(r);
+      } else {
+        ensureCaptureSource();
+        stats = { total: 0, methods: {}, statuses: {}, sources: {}, totalDuration: 0, errors: 0 };
+        const captures = await getSessionCaptures(sessionName);
+        for (const capture of captures) {
+          if (!capture || capture.domain !== domain) continue;
+          stats.total++;
+          const method = String(capture.method || 'GET');
+          const status = capture.responseStatus;
+          const source = capture.source || 'fetch';
+          const duration = Number(capture.duration) || 0;
+          stats.methods[method] = (stats.methods[method] || 0) + 1;
+          stats.statuses[status] = (stats.statuses[status] || 0) + 1;
+          stats.sources[source] = (stats.sources[source] || 0) + 1;
+          stats.totalDuration += duration;
+          if (status >= 400 || status === 0) stats.errors++;
+        }
+      }
       if (!stats.total) { console.log(`No captures for ${domain}`); break; }
       console.log(`${domain} — ${stats.total} captures\n`);
       console.log(`Methods:  ${Object.entries(stats.methods).map(([k,v])=>`${k}: ${v}`).join(', ')}`);
@@ -2826,24 +3375,42 @@ commands.capture = async function(args) {
       const limit = parseInt(flags.limit) || 20;
       const methodFilter = flags.method ? flags.method.toUpperCase() : null;
       const statusFilter = flags.status ? parseInt(flags.status) : null;
-      const r = await cdpEval(wsUrl, dbEval(`
-        var rows = [], query = ${JSON.stringify(query)}, limit = ${limit};
-        var methodFilter = ${methodFilter ? JSON.stringify(methodFilter) : 'null'};
-        var statusFilter = ${statusFilter || 'null'};
-        store.openCursor(null, "prev").onsuccess = function(e) {
-          var c = e.target.result;
-          if (c && rows.length < limit) {
-            var v = c.value;
-            if (v.url.indexOf(query) >= 0 || (v.domain && v.domain.indexOf(query) >= 0)) {
-              if (methodFilter && v.method !== methodFilter) { c.continue(); return; }
-              if (statusFilter && v.responseStatus !== statusFilter) { c.continue(); return; }
-              rows.push(v.id + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)");
-            }
-            c.continue();
-          } else { resolve(rows.join("\\n")); }
-        };
-      `));
-      console.log(r || '(no matches)');
+      if (extensionWsUrl) {
+        const r = await cdpEval(extensionWsUrl, dbEval(`
+          var rows = [], query = ${JSON.stringify(query)}, limit = ${limit};
+          var methodFilter = ${methodFilter ? JSON.stringify(methodFilter) : 'null'};
+          var statusFilter = ${statusFilter || 'null'};
+          store.openCursor(null, "prev").onsuccess = function(e) {
+            var c = e.target.result;
+            if (c && rows.length < limit) {
+              var v = c.value;
+              if (v.url.indexOf(query) >= 0 || (v.domain && v.domain.indexOf(query) >= 0)) {
+                if (methodFilter && v.method !== methodFilter) { c.continue(); return; }
+                if (statusFilter && v.responseStatus !== statusFilter) { c.continue(); return; }
+                rows.push(v.id + "  " + v.method + " " + v.responseStatus + " " + v.url.slice(0, 100) + " (" + v.duration + "ms)");
+              }
+              c.continue();
+            } else { resolve(rows.join("\\n")); }
+          };
+        `));
+        console.log(r || '(no matches)');
+      } else {
+        ensureCaptureSource();
+        const captures = await getSessionCaptures(sessionName);
+        const rows = [];
+        const sorted = captures.slice().sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+        for (const capture of sorted) {
+          if (!capture || typeof capture !== 'object') continue;
+          if (rows.length >= limit) break;
+          const url = String(capture.url || '');
+          const captureDomain = String(capture.domain || '');
+          if (url.indexOf(query) < 0 && captureDomain.indexOf(query) < 0) continue;
+          if (methodFilter && String(capture.method || '').toUpperCase() !== methodFilter) continue;
+          if (statusFilter && Number(capture.responseStatus) !== statusFilter) continue;
+          rows.push(`${capture.id || ''}  ${capture.method || 'GET'} ${capture.responseStatus} ${url.slice(0, 100)} (${Number(capture.duration) || 0}ms)`);
+        }
+        console.log(rows.join('\n') || '(no matches)');
+      }
       break;
     }
 
@@ -2854,7 +3421,7 @@ commands.capture = async function(args) {
       const data = JSON.parse(fs.readFileSync(file, 'utf8'));
       const items = Array.isArray(data) ? data : [data];
       if (!items.length) { console.log('No captures in file'); break; }
-      const wsUrl = await findExtensionWs();
+      const wsUrl = await requireExtensionWs();
       // Import in batches of 50 via the extension's IndexedDB
       const batchSize = 50;
       let imported = 0;
@@ -2886,6 +3453,7 @@ commands.capture = async function(args) {
     }
 
     case 'watch': {
+      const wsUrl = await requireExtensionWs();
       const domain = positional[1];
       console.error(`Watching captures${domain ? ' for ' + domain : ''}... (Ctrl+C to stop)`);
       let lastTimestamp = Date.now();
@@ -2924,6 +3492,7 @@ commands.capture = async function(args) {
     }
 
     case 'summary': {
+      const wsUrl = await requireExtensionWs();
       // Quick overview optimized for AI agents
       const r = await cdpEval(wsUrl, dbEval(`
         var domains = {}, sources = {}, total = 0, oldest = Infinity, newest = 0;
@@ -2957,6 +3526,7 @@ commands.capture = async function(args) {
     }
 
     case 'prune': {
+      const wsUrl = await requireExtensionWs();
       const older = flags['older-than'] || flags.older || '7d';
       const cutoff = Date.now() - parseDuration(older);
       const r = await cdpEval(wsUrl, `new Promise(function(resolve) {
@@ -2982,6 +3552,7 @@ commands.capture = async function(args) {
     }
 
     case 'gc': {
+      const wsUrl = await requireExtensionWs();
       // Smart garbage collection: keep one capture per unique (method, path pattern, status) combo per domain
       // Keeps the most recent of each unique pattern
       const domain = positional[1];
@@ -3065,35 +3636,50 @@ commands.capture = async function(args) {
 };
 
 // neo schema <action>
-commands.schema = async function(args) {
+commands.schema = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const cdpUrl = getSessionCdpUrl(sessionName);
 
   switch (action) {
     case 'generate': {
       const domain = positional[1];
+      const extensionWsUrl = await findExtensionWs({ cdpUrl });
+      const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
       
       // --all: generate schemas for all domains with captures
       if (flags.all || domain === '--all') {
-        const wsUrl = await findExtensionWs();
-        const domainsJson = await cdpEval(wsUrl, `new Promise(function(resolve) {
-          var req = indexedDB.open("${DB_NAME}");
-          req.onsuccess = function() {
-            var db = req.result;
-            var tx = db.transaction("${STORE_NAME}", "readonly");
-            var store = tx.objectStore("${STORE_NAME}");
-            var idx = store.index("domain");
-            var domains = {};
-            idx.openKeyCursor().onsuccess = function(e) {
-              var c = e.target.result;
-              if (c) { domains[c.key] = (domains[c.key] || 0) + 1; c.continue(); }
-              else { resolve(JSON.stringify(domains)); }
+        let domainCounts = {};
+        if (extensionWsUrl) {
+          const domainsJson = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
+            var req = indexedDB.open("${DB_NAME}");
+            req.onsuccess = function() {
+              var db = req.result;
+              var tx = db.transaction("${STORE_NAME}", "readonly");
+              var store = tx.objectStore("${STORE_NAME}");
+              var idx = store.index("domain");
+              var domains = {};
+              idx.openKeyCursor().onsuccess = function(e) {
+                var c = e.target.result;
+                if (c) { domains[c.key] = (domains[c.key] || 0) + 1; c.continue(); }
+                else { resolve(JSON.stringify(domains)); }
+              };
             };
-          };
-          req.onerror = function() { resolve('{}'); };
-        })`, 10000);
-        
-        const domainCounts = JSON.parse(domainsJson || '{}');
+            req.onerror = function() { resolve('{}'); };
+          })`, 10000);
+          domainCounts = JSON.parse(domainsJson || '{}');
+        } else {
+          if (!sessionMode) {
+            throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
+          }
+          const captures = await getSessionCaptures(sessionName);
+          for (const capture of captures) {
+            const d = capture && capture.domain ? String(capture.domain) : '';
+            if (!d) continue;
+            domainCounts[d] = (domainCounts[d] || 0) + 1;
+          }
+        }
         const domainList = Object.entries(domainCounts)
           .filter(([, count]) => count >= 2)  // skip domains with only 1 capture
           .sort((a, b) => b[1] - a[1]);
@@ -3109,7 +3695,8 @@ commands.schema = async function(args) {
           try {
             // Inline the single-domain generation (call the same CLI)
             const { execSync } = require('child_process');
-            execSync(`node ${__filename} schema generate ${d} --json`, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 40000 });
+            const sessionArg = sessionName ? ` --session ${shellEscape(sessionName)}` : '';
+            execSync(`node ${__filename} schema generate ${shellEscape(d)} --json${sessionArg}`, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 40000 });
             console.log('✓');
             generated++;
           } catch (e) {
@@ -3123,9 +3710,10 @@ commands.schema = async function(args) {
       
       if (!domain) { console.error('Usage: neo schema generate <domain> | neo schema generate --all'); process.exit(1); }
       
-      const wsUrl = await findExtensionWs();
-      // Run schema analysis INSIDE the browser to avoid transferring raw captures
-      const schemaJson = await cdpEval(wsUrl, `new Promise(function(resolve) {
+      let schema;
+      if (extensionWsUrl) {
+        // Run schema analysis INSIDE the browser to avoid transferring raw captures
+        const schemaJson = await cdpEval(extensionWsUrl, `new Promise(function(resolve) {
         var req = indexedDB.open("${DB_NAME}");
         req.onsuccess = function() {
           var db = req.result;
@@ -3315,10 +3903,17 @@ commands.schema = async function(args) {
         req.onerror = function() { resolve(JSON.stringify({error: "DB open failed"})); };
         setTimeout(function() { resolve(JSON.stringify({error: "timeout"})); }, 30000);
       })`, 35000);
-      
-      let schema;
-      try { schema = JSON.parse(schemaJson); } catch { console.error('Failed to parse schema result'); process.exit(1); }
-      if (schema.error) { console.error('Error:', schema.error); process.exit(1); }
+
+        try { schema = JSON.parse(schemaJson); } catch { console.error('Failed to parse schema result'); process.exit(1); }
+        if (schema.error) { console.error('Error:', schema.error); process.exit(1); }
+      } else {
+        if (!sessionMode) {
+          throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
+        }
+        const captures = await getSessionCaptures(sessionName);
+        schema = buildSchemaFromCaptures(domain, captures);
+      }
+
       if (!schema.totalCaptures) { console.error(`No captures for ${domain}`); process.exit(1); }
       
       // Save to schema dir (with diff detection)
@@ -3672,16 +4267,18 @@ commands.schema = async function(args) {
 };
 
 // neo exec <url> [options]
-commands.exec = async function(args) {
+commands.exec = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args);
   const url = positional[0];
   if (!url) { console.error('Usage: neo exec <url> [--method POST] [--header "K: V"] [--body "{}"] [--tab pattern] [--auto-headers]'); process.exit(1); }
 
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const cdpUrl = getSessionCdpUrl(sessionName);
   const method = (flags.method || 'GET').toUpperCase();
   const tabPattern = flags.tab || flags['tab-url'] || null;
   const body = flags.body || null;
   const headers = {};
-  const wsUrl = await findExtensionWs();
+  const extensionWsUrl = await findExtensionWs({ cdpUrl });
   const domain = new URL(url).hostname;
 
   // Parse --header flags (may appear multiple times in raw argv)
@@ -3696,10 +4293,13 @@ commands.exec = async function(args) {
 
   let tab;
   if (tabPattern) {
-    tab = await findTab(tabPattern);
+    tab = await findTab(tabPattern, { cdpUrl });
   } else {
-    try { tab = await findTab(domain); }
-    catch { tab = await findTab(null); }
+    try { tab = await findTab(domain, { cdpUrl }); }
+    catch { tab = await findTab(null, { cdpUrl }); }
+  }
+  if (!tab || !tab.webSocketDebuggerUrl) {
+    throw new Error(`No page target found for ${cdpUrl}`);
   }
 
   // Auto-detect auth headers from live browser traffic, with legacy capture fallback.
@@ -3707,7 +4307,7 @@ commands.exec = async function(args) {
     try {
       const probeUrl = `${new URL(url).origin}/`;
       const { liveHeaders, fallbackHeaders } = await collectExecutionAuthHeaders({
-        wsUrl,
+        wsUrl: extensionWsUrl,
         tab,
         domain,
         probeUrl,
@@ -3726,7 +4326,8 @@ commands.exec = async function(args) {
   }
 
   stripForbiddenFetchHeaders(headers);
-  console.error(`${method} ${url.slice(0, 80)}... → tab: ${tab.url.slice(0, 50)}...`);
+  const tabUrl = String(tab.url || '');
+  console.error(`${method} ${url.slice(0, 80)}... → tab: ${tabUrl.slice(0, 50)}...`);
 
   const fetchOpts = { method, headers, credentials: 'include' };
   if (body && method !== 'GET') {
@@ -3784,28 +4385,43 @@ commands.open = async function(args) {
 };
 
 // neo replay <id> [--tab pattern] [--auto-headers]
-commands.replay = async function(args) {
+commands.replay = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args);
   const id = positional[0];
   if (!id) { console.error('Usage: neo replay <capture-id> [--tab pattern] [--auto-headers]'); process.exit(1); }
 
-  // Fetch the capture details
-  const wsUrl = await findExtensionWs();
-  const raw = await cdpEval(wsUrl, dbEval(`
-    var targetId = ${JSON.stringify(id)};
-    store.get(targetId).onsuccess = function(e) {
-      if (e.target.result) { resolve(JSON.stringify(e.target.result)); }
-      else {
-        var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
-        store.openCursor(bound).onsuccess = function(e2) {
-          var c = e2.target.result;
-          resolve(c ? JSON.stringify(c.value) : "null");
-        };
-      }
-    };
-  `));
-  if (raw === 'null' || !raw) { console.error(`Capture not found: ${id}`); process.exit(1); }
-  const capture = JSON.parse(raw);
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const cdpUrl = getSessionCdpUrl(sessionName);
+  const extensionWsUrl = await findExtensionWs({ cdpUrl });
+  const sessionMode = await isSessionMode(sessionName, { cdpUrl, extensionWsUrl });
+
+  let capture = null;
+  if (extensionWsUrl) {
+    const raw = await cdpEval(extensionWsUrl, dbEval(`
+      var targetId = ${JSON.stringify(id)};
+      store.get(targetId).onsuccess = function(e) {
+        if (e.target.result) { resolve(JSON.stringify(e.target.result)); }
+        else {
+          var bound = IDBKeyRange.bound(targetId, targetId + "\\uffff");
+          store.openCursor(bound).onsuccess = function(e2) {
+            var c = e2.target.result;
+            resolve(c ? JSON.stringify(c.value) : "null");
+          };
+        }
+      };
+    `));
+    if (raw && raw !== 'null') {
+      capture = JSON.parse(raw);
+    }
+  } else if (sessionMode) {
+    const captures = await getSessionCaptures(sessionName, { sort: 'timestamp-desc' });
+    capture = captures.find(item => item && String(item.id || '') === id)
+      || captures.find(item => item && String(item.id || '').startsWith(id))
+      || null;
+  } else {
+    throw new Error(`${EXTENSION_NOT_FOUND_MESSAGE}\n  - Or run neo connect [port] then neo inject for session fallback mode`);
+  }
+  if (!capture) { console.error(`Capture not found: ${id}`); process.exit(1); }
 
   if (capture.method.startsWith('WS_')) {
     console.error('Cannot replay WebSocket captures. Use neo exec for HTTP calls.');
@@ -3813,9 +4429,12 @@ commands.replay = async function(args) {
   }
 
   const tabPattern = flags.tab || capture.domain;
-  const tab = await findTab(tabPattern);
+  const tab = await findTab(tabPattern, { cdpUrl });
+  if (!tab || !tab.webSocketDebuggerUrl) {
+    throw new Error(`No page target found for ${cdpUrl}`);
+  }
   console.error(`Replaying: ${capture.method} ${capture.url.slice(0, 80)}...`);
-  console.error(`Target tab: ${tab.url.slice(0, 60)}...`);
+  console.error(`Target tab: ${String(tab.url || '').slice(0, 60)}...`);
 
   const headers = { ...(capture.requestHeaders || {}) };
 
@@ -3823,7 +4442,7 @@ commands.replay = async function(args) {
     try {
       const probeUrl = `${new URL(capture.url).origin}/`;
       const { liveHeaders, fallbackHeaders } = await collectExecutionAuthHeaders({
-        wsUrl,
+        wsUrl: extensionWsUrl,
         tab,
         domain: capture.domain,
         probeUrl,
