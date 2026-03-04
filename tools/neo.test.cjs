@@ -427,7 +427,7 @@ function buildInjectScript(sourceCode) {
       globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__ = function(event) {
         try {
           var data = event && event.data;
-          if (!data || data.type !== 'neo:capture_request' || !data.payload) return;
+          if (!data || data.type !== '__neo_capture_request' || !data.payload) return;
           globalThis.__NEO_CAPTURES__.push(data.payload);
           if (globalThis.__NEO_CAPTURES__.length > 500) {
             globalThis.__NEO_CAPTURES__.shift();
@@ -951,7 +951,7 @@ test('buildInjectScript wraps source with reporter and capture array', () => {
   const script = buildInjectScript('globalThis.__NEO_CAPTURES__.push({ ok: true });');
   assert.ok(script.includes('__NEO_CAPTURES__'));
   assert.ok(script.includes('__NEO_CAPTURE_MESSAGE_LISTENER__'));
-  assert.ok(script.includes('neo:capture_request'));
+  assert.ok(script.includes('__neo_capture_request'));
   assert.ok(script.includes('__neoMiniReporter'));
   assert.ok(script.includes('inject:ready'));
 });
