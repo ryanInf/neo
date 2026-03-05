@@ -1,23 +1,46 @@
 {
-  "name": "neo-extension",
-  "private": true,
-  "version": "1.1.0",
+  "name": "@4ier/neo",
+  "version": "0.4.0",
+  "description": "Turn any website into an AI-callable API. Passive traffic capture, API schema generation, and execution.",
   "type": "module",
   "scripts": {
     "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build",
     "test": "node tools/neo.test.cjs"
   },
+  "bin": {
+    "neo": "tools/neo.cjs"
+  },
+  "files": [
+    "tools/neo.cjs",
+    "extension-dist/background.js",
+    "extension-dist/content.js",
+    "extension-dist/inject.js",
+    "extension-dist/manifest.json"
+  ],
+  "keywords": [
+    "browser",
+    "api",
+    "chrome",
+    "cdp",
+    "automation",
+    "web-scraping",
+    "ai-agent",
+    "openclaw"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4ier/neo.git"
+  },
+  "license": "MIT",
+  "author": "4ier",
   "dependencies": {
-    "dexie": "^4.0.11",
     "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.303",
     "@types/node": "^22.10.5",
+    "dexie": "^4.0.11",
     "typescript": "^5.8.2",
     "vite": "^6.0.0"
-  },
-  "bin": {
-    "neo": "tools/neo.cjs"
   }
 }
