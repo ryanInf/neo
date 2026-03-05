@@ -45,6 +45,8 @@ const AUTH_HEADER_PATTERNS = [
 
 const REDACTED_HEADER_VALUE = '[REDACTED]';
 const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
+const CDP_URL = 'http://localhost:9222';
+const NEO_EXTENSION_ID = 'ikikhldfkbfmcbandaagjomhchlehjap';
 const SESSION_FILE = path.join(os.tmpdir(), `neo-sessions-test-${process.pid}.json`);
 const DEFAULT_SESSION_NAME = '__default__';
 const ELECTRON_APPS = Object.freeze({
@@ -220,6 +222,87 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   return sessions[name];
 }
 
+async function findExtensionWs(deps = {}) {
+  const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : async () => ({ ok: false, json: async () => [] });
+  const cdpUrl = deps.cdpUrl || CDP_URL;
+  try {
+    const resp = await fetchFn(`${cdpUrl}/json/list`);
+    if (!resp || !resp.ok) return null;
+    const tabs = await resp.json();
+    const sw = (Array.isArray(tabs) ? tabs : [])
+      .find(t => t.type === 'service_worker' && String(t.url || '').includes(NEO_EXTENSION_ID));
+    if (!sw || !sw.webSocketDebuggerUrl) return null;
+    return sw.webSocketDebuggerUrl;
+  } catch {
+    return null;
+  }
+}
+
+async function isSessionMode(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const findExtensionWsFn = typeof deps.findExtensionWs === 'function' ? deps.findExtensionWs : findExtensionWs;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    return false;
+  }
+  if (deps.extensionWsUrl !== undefined) {
+    return !deps.extensionWsUrl;
+  }
+  const cdpUrl = deps.cdpUrl || session.cdpUrl || CDP_URL;
+  const extensionWsUrl = await findExtensionWsFn({ cdpUrl });
+  return !extensionWsUrl;
+}
+
+function applySessionCaptureFilters(captures, filters = {}) {
+  if (!Array.isArray(captures)) return [];
+  const config = (filters && typeof filters === 'object' && !Array.isArray(filters)) ? filters : {};
+  let rows = captures.slice();
+
+  if (config.domain) {
+    const expected = String(config.domain);
+    rows = rows.filter(item => String(item && item.domain || '') === expected);
+  }
+  if (config.method) {
+    const expectedMethod = String(config.method).toUpperCase();
+    rows = rows.filter(item => String(item && item.method || '').toUpperCase() === expectedMethod);
+  }
+  if (config.status !== undefined && config.status !== null && config.status !== '') {
+    const expectedStatus = Number(config.status);
+    rows = rows.filter(item => Number(item && item.responseStatus) === expectedStatus);
+  }
+  if (config.query) {
+    const needle = String(config.query);
+    rows = rows.filter((item) => {
+      const url = String(item && item.url || '');
+      const domain = String(item && item.domain || '');
+      return url.includes(needle) || domain.includes(needle);
+    });
+  }
+  if (config.id) {
+    const targetId = String(config.id);
+    rows = rows.filter(item => String(item && item.id || '') === targetId);
+  }
+  if (config.idPrefix) {
+    const targetPrefix = String(config.idPrefix);
+    rows = rows.filter(item => String(item && item.id || '').startsWith(targetPrefix));
+  }
+  if (config.since) {
+    const sinceTs = Number(config.since) || 0;
+    rows = rows.filter(item => (Number(item && item.timestamp) || 0) >= sinceTs);
+  }
+  if (config.sort === 'timestamp-desc') {
+    rows.sort((a, b) => (Number(b && b.timestamp) || 0) - (Number(a && a.timestamp) || 0));
+  }
+
+  const limit = Number(config.limit);
+  if (Number.isFinite(limit) && limit > 0) {
+    rows = rows.slice(0, limit);
+  }
+
+  return rows;
+}
+
 function normalizeElectronAppName(appName) {
   const normalized = String(appName || '').trim().toLowerCase();
   if (normalized === 'vscode') return 'code';
@@ -339,6 +422,19 @@ function buildInjectScript(sourceCode) {
   try {
     if (!Array.isArray(globalThis.__NEO_CAPTURES__)) {
       globalThis.__NEO_CAPTURES__ = [];
+    }
+    if (!globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__) {
+      globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__ = function(event) {
+        try {
+          var data = event && event.data;
+          if (!data || data.type !== '__neo_capture_request' || !data.payload) return;
+          globalThis.__NEO_CAPTURES__.push(data.payload);
+          if (globalThis.__NEO_CAPTURES__.length > 500) {
+            globalThis.__NEO_CAPTURES__.shift();
+          }
+        } catch {}
+      };
+      window.addEventListener('message', globalThis.__NEO_CAPTURE_MESSAGE_LISTENER__);
     }
     if (typeof globalThis.__neoMiniReporter !== 'function') {
       globalThis.__neoMiniReporter = function(event, payload) {
@@ -854,6 +950,8 @@ test('loadInjectScriptSource falls back to extension-dist/content.js', () => {
 test('buildInjectScript wraps source with reporter and capture array', () => {
   const script = buildInjectScript('globalThis.__NEO_CAPTURES__.push({ ok: true });');
   assert.ok(script.includes('__NEO_CAPTURES__'));
+  assert.ok(script.includes('__NEO_CAPTURE_MESSAGE_LISTENER__'));
+  assert.ok(script.includes('__neo_capture_request'));
   assert.ok(script.includes('__neoMiniReporter'));
   assert.ok(script.includes('inject:ready'));
 });
@@ -898,6 +996,80 @@ test('saveSessions normalizes invalid input to empty object', () => {
   resetSessionFile();
   saveSessions(null);
   assert.deepStrictEqual(loadSessions(), {});
+});
+
+console.log('\nextension/session mode:');
+test('findExtensionWs returns null when CDP fetch throws', async () => {
+  const wsUrl = await findExtensionWs({
+    fetch: async () => {
+      throw new Error('connection refused');
+    },
+  });
+  assert.strictEqual(wsUrl, null);
+});
+
+test('findExtensionWs selects matching extension service worker', async () => {
+  const wsUrl = await findExtensionWs({
+    fetch: async () => ({
+      ok: true,
+      json: async () => ([
+        { type: 'page', url: 'https://example.com', webSocketDebuggerUrl: 'ws://page' },
+        { type: 'service_worker', url: `chrome-extension://${NEO_EXTENSION_ID}/background.js`, webSocketDebuggerUrl: 'ws://sw-neo' },
+        { type: 'service_worker', url: 'chrome-extension://other/background.js', webSocketDebuggerUrl: 'ws://sw-other' },
+      ]),
+    }),
+  });
+  assert.strictEqual(wsUrl, 'ws://sw-neo');
+});
+
+test('isSessionMode is true when session exists and extension is missing', async () => {
+  const mode = await isSessionMode('team-a', {
+    getSession: () => ({ pageWsUrl: 'ws://page', cdpUrl: 'http://localhost:9225' }),
+    findExtensionWs: async () => null,
+  });
+  assert.strictEqual(mode, true);
+});
+
+test('isSessionMode is false when extension service worker exists', async () => {
+  const mode = await isSessionMode('team-a', {
+    getSession: () => ({ pageWsUrl: 'ws://page', cdpUrl: 'http://localhost:9225' }),
+    findExtensionWs: async () => 'ws://sw',
+  });
+  assert.strictEqual(mode, false);
+});
+
+test('isSessionMode is false without active session', async () => {
+  const mode = await isSessionMode('missing', {
+    getSession: () => null,
+    findExtensionWs: async () => null,
+  });
+  assert.strictEqual(mode, false);
+});
+
+test('applySessionCaptureFilters filters by domain, method, status, and query', () => {
+  const filtered = applySessionCaptureFilters([
+    { id: 'a1', domain: 'a.com', method: 'GET', responseStatus: 200, url: 'https://a.com/feed' },
+    { id: 'a2', domain: 'a.com', method: 'POST', responseStatus: 201, url: 'https://a.com/post' },
+    { id: 'b1', domain: 'b.com', method: 'GET', responseStatus: 200, url: 'https://b.com/feed' },
+  ], {
+    domain: 'a.com',
+    method: 'POST',
+    status: 201,
+    query: '/post',
+  });
+  assert.deepStrictEqual(filtered.map(item => item.id), ['a2']);
+});
+
+test('applySessionCaptureFilters supports timestamp sorting and limit', () => {
+  const filtered = applySessionCaptureFilters([
+    { id: 'x1', timestamp: 1000 },
+    { id: 'x2', timestamp: 3000 },
+    { id: 'x3', timestamp: 2000 },
+  ], {
+    sort: 'timestamp-desc',
+    limit: 2,
+  });
+  assert.deepStrictEqual(filtered.map(item => item.id), ['x2', 'x3']);
 });
 
 console.log('\nassignRefs + formatSnapshot:');
