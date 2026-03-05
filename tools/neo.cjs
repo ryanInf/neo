@@ -2424,14 +2424,75 @@ commands.setup = async function(args) {
   };
   fs.writeFileSync(NEO_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
+  // Pre-register Neo extension in Chrome Preferences (zero-config install)
+  const profileDefaultDir = path.join(NEO_HOME_DIR, 'chrome-profile', 'Default');
+  const prefsFile = path.join(profileDefaultDir, 'Preferences');
+  fs.mkdirSync(profileDefaultDir, { recursive: true });
+  let prefs = {};
+  try {
+    if (fs.existsSync(prefsFile)) {
+      prefs = JSON.parse(fs.readFileSync(prefsFile, 'utf8'));
+    }
+  } catch {}
+
+  // Enable developer mode
+  if (!prefs.extensions) prefs.extensions = {};
+  if (!prefs.extensions.ui) prefs.extensions.ui = {};
+  prefs.extensions.ui.developer_mode = true;
+
+  // Generate deterministic extension ID from path (same algorithm Chrome uses for unpacked)
+  const crypto = require('crypto');
+  const extRealPath = fs.realpathSync(NEO_EXTENSION_DIR);
+  const hashHex = crypto.createHash('sha256').update(extRealPath).digest('hex').slice(0, 32);
+  const extensionId = [...hashHex].map(c => String.fromCharCode('a'.charCodeAt(0) + parseInt(c, 16))).join('');
+
+  // Read extension manifest for permissions
+  const manifest = JSON.parse(fs.readFileSync(path.join(NEO_EXTENSION_DIR, 'manifest.json'), 'utf8'));
+  const permissions = manifest.permissions || [];
+
+  // Register as unpacked extension (location: 4)
+  if (!prefs.extensions.settings) prefs.extensions.settings = {};
+  prefs.extensions.settings[extensionId] = {
+    account_extension_type: 0,
+    active_permissions: {
+      api: permissions,
+      explicit_host: ['<all_urls>'],
+      manifest_permissions: [],
+      scriptable_host: ['<all_urls>'],
+    },
+    content_settings: [],
+    creation_flags: 38,
+    first_install_time: String(Date.now() * 10000 + 116444736000000000),
+    from_webstore: false,
+    granted_permissions: {
+      api: permissions,
+      explicit_host: ['<all_urls>'],
+      manifest_permissions: [],
+      scriptable_host: ['<all_urls>'],
+    },
+    incognito_content_settings: [],
+    incognito_preferences: {},
+    location: 4,
+    newAllowFileAccess: true,
+    path: extRealPath,
+    preferences: {},
+    regular_only_preferences: {},
+    state: 1,
+    was_installed_by_default: false,
+    was_installed_by_oem: false,
+    withholding_permissions: false,
+  };
+
+  fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2) + '\n', 'utf8');
+
   console.log('Neo setup complete');
   console.log(`  Chrome binary: ${chromePath}`);
   console.log(`  Extension dir: ${NEO_EXTENSION_DIR}`);
+  console.log(`  Extension ID: ${extensionId}`);
   console.log(`  Config file: ${NEO_CONFIG_FILE}`);
   console.log(`  Schema dir: ${setupSchemaDir}`);
   console.log('');
-  console.log('Launch Chrome with:');
-  console.log(`  ${chromePath} --load-extension=~/.neo/extension --remote-debugging-port=9222`);
+  console.log('Launch Chrome with: neo start');
 };
 
 // neo start
@@ -2469,9 +2530,14 @@ commands.start = async function(args) {
     throw new Error(`Chrome binary does not exist: ${chromePath}`);
   }
 
+  const userDataDir = String(config && config.userDataDir || '').trim() || path.join(NEO_HOME_DIR, 'chrome-profile');
+  fs.mkdirSync(userDataDir, { recursive: true });
+
   const child = spawn(chromePath, [
-    `--load-extension=${NEO_EXTENSION_DIR}`,
     `--remote-debugging-port=${cdpPort}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
   ], {
     detached: true,
     stdio: 'ignore',
