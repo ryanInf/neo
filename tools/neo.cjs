@@ -18,6 +18,8 @@
 //   neo open <url>                          Open URL in Chrome
 //   neo replay <id> [--tab pattern] [--auto-headers] Replay a captured API call
 //   neo read <tab-pattern>                  Extract readable text from page
+//   neo setup                               Setup Neo local config + extension assets
+//   neo start                               Launch Chrome with Neo extension from config
 //   neo launch <app> [--port N]             Launch Electron app with CDP enabled
 //   neo connect [port]                      Connect to Chrome/Electron CDP and save session
 //   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
@@ -51,10 +53,14 @@ const { spawn, execSync } = require('child_process');
 const CDP_URL = process.env.NEO_CDP_URL || 'http://localhost:9222';
 const DB_NAME = 'neo-capture-v01';
 const STORE_NAME = 'capturedRequests';
-const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || 'ikikhldfkbfmcbandaagjomhchlehjap';
-const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, 'clawd/skills/neo/schemas');
+const NEO_EXTENSION_ID = process.env.NEO_EXTENSION_ID || null;
+const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, '.neo/schemas');
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
+const EXTENSION_ID_CACHE_FILE = '/tmp/neo-ext-id';
+const NEO_HOME_DIR = path.join(process.env.HOME, '.neo');
+const NEO_CONFIG_FILE = path.join(NEO_HOME_DIR, 'config.json');
+const NEO_EXTENSION_DIR = path.join(NEO_HOME_DIR, 'extension');
 const DEFAULT_SESSION_NAME = '__default__';
 const EXTENSION_NOT_FOUND_MESSAGE = 'Neo extension service worker not found. Is it installed and active?\n  - Check chrome://extensions for the Neo extension\n  - Make sure Chrome was launched with --remote-debugging-port=9222';
 const ELECTRON_APPS = Object.freeze({
@@ -123,6 +129,66 @@ function commandExists(commandName) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function resolveCommandPath(commandName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : execSync;
+  const name = String(commandName || '').trim();
+  if (!name || name.includes('/')) return null;
+  try {
+    const output = String(execSyncFn(`command -v ${shellEscape(name)}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/sh',
+    }) || '');
+    const resolved = output.trim().split('\n')[0];
+    return resolved || null;
+  } catch {
+    return null;
+  }
+}
+
+function detectChromeBinaryPath(deps = {}) {
+  const resolveCommandPathFn = typeof deps.resolveCommandPath === 'function' ? deps.resolveCommandPath : resolveCommandPath;
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const platform = deps.platform || process.platform;
+  const candidates = ['google-chrome-stable', 'google-chrome', 'chromium-browser', 'chromium'];
+
+  for (const candidate of candidates) {
+    const resolved = resolveCommandPathFn(candidate);
+    if (resolved) return resolved;
+  }
+
+  if (platform === 'darwin') {
+    const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    if (existsSyncFn(macChromePath)) return macChromePath;
+  }
+
+  return null;
+}
+
+function copyDirectoryRecursive(sourceDir, destinationDir, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const mkdirSyncFn = typeof deps.mkdirSync === 'function' ? deps.mkdirSync : fs.mkdirSync;
+  const readdirSyncFn = typeof deps.readdirSync === 'function' ? deps.readdirSync : fs.readdirSync;
+  const copyFileSyncFn = typeof deps.copyFileSync === 'function' ? deps.copyFileSync : fs.copyFileSync;
+  if (!existsSyncFn(sourceDir)) {
+    throw new Error(`Missing extension source directory: ${sourceDir}`);
+  }
+
+  mkdirSyncFn(destinationDir, { recursive: true });
+  const entries = readdirSyncFn(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(sourceDir, entry.name);
+    const destPath = path.join(destinationDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(srcPath, destPath, deps);
+      continue;
+    }
+    if (entry.isFile()) {
+      copyFileSyncFn(srcPath, destPath);
+    }
   }
 }
 
@@ -220,21 +286,80 @@ async function waitForCdpPort(port, timeoutMs = 10000, intervalMs = 250, deps = 
 
 // ─── CDP Helpers ────────────────────────────────────────────────
 
-async function findExtensionWs(deps = {}) {
+function parseExtensionIdFromUrl(url) {
+  const match = String(url || '').match(/^chrome-extension:\/\/([a-z]{32})\//i);
+  if (!match) return null;
+  return match[1].toLowerCase();
+}
+
+function findServiceWorkerByExtensionId(serviceWorkers, extensionId) {
+  const expected = String(extensionId || '').trim().toLowerCase();
+  if (!expected) return null;
+  const workers = Array.isArray(serviceWorkers) ? serviceWorkers : [];
+  for (const worker of workers) {
+    const found = parseExtensionIdFromUrl(worker && worker.url);
+    if (found === expected) return worker;
+  }
+  return null;
+}
+
+async function findExtensionServiceWorker(deps = {}) {
   const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : fetch;
+  const cdpEvalFn = typeof deps.cdpEval === 'function' ? deps.cdpEval : cdpEval;
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : fs.readFileSync;
+  const writeFileSyncFn = typeof deps.writeFileSync === 'function' ? deps.writeFileSync : fs.writeFileSync;
   const cdpUrl = deps.cdpUrl || CDP_URL;
+  const extensionId = deps.extensionId !== undefined ? deps.extensionId : NEO_EXTENSION_ID;
+  const extensionIdCacheFile = deps.extensionIdCacheFile || EXTENSION_ID_CACHE_FILE;
+
   try {
     const resp = await fetchFn(`${cdpUrl}/json/list`);
     if (!resp || !resp.ok) return null;
     const tabs = await resp.json();
-    // Must match the service_worker, not the extensions page
-    const sw = (Array.isArray(tabs) ? tabs : [])
-      .find(t => t.type === 'service_worker' && String(t.url || '').includes(NEO_EXTENSION_ID));
-    if (!sw || !sw.webSocketDebuggerUrl) return null;
-    return sw.webSocketDebuggerUrl;
+    const serviceWorkers = (Array.isArray(tabs) ? tabs : [])
+      .filter(t => t && t.type === 'service_worker' && typeof t.webSocketDebuggerUrl === 'string' && t.webSocketDebuggerUrl.trim());
+
+    if (extensionId) {
+      return findServiceWorkerByExtensionId(serviceWorkers, extensionId);
+    }
+
+    let cachedExtensionId = '';
+    try {
+      if (existsSyncFn(extensionIdCacheFile)) {
+        cachedExtensionId = String(readFileSyncFn(extensionIdCacheFile, 'utf8') || '').trim();
+      }
+    } catch {}
+
+    if (cachedExtensionId) {
+      const cachedWorker = findServiceWorkerByExtensionId(serviceWorkers, cachedExtensionId);
+      if (cachedWorker) return cachedWorker;
+    }
+
+    for (const worker of serviceWorkers) {
+      try {
+        const manifestName = await cdpEvalFn(worker.webSocketDebuggerUrl, 'chrome.runtime.getManifest().name', 5000);
+        if (manifestName !== 'Neo') continue;
+        const discoveredId = parseExtensionIdFromUrl(worker.url);
+        if (discoveredId) {
+          try {
+            writeFileSyncFn(extensionIdCacheFile, `${discoveredId}\n`, 'utf8');
+          } catch {}
+        }
+        return worker;
+      } catch {}
+    }
+
+    return null;
   } catch {
     return null;
   }
+}
+
+async function findExtensionWs(deps = {}) {
+  const worker = await findExtensionServiceWorker(deps);
+  if (!worker || !worker.webSocketDebuggerUrl) return null;
+  return worker.webSocketDebuggerUrl;
 }
 
 async function requireExtensionWs() {
@@ -2270,6 +2395,97 @@ const commands = {};
 commands.version = function() {
   const pkg = JSON.parse(fs.readFileSync(path.join(fs.realpathSync(__dirname), '..', 'package.json'), 'utf8'));
   console.log(`neo v${pkg.version}`);
+};
+
+// neo setup
+commands.setup = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 0 || Object.keys(flags).length > 0) {
+    console.error('Usage: neo setup');
+    process.exit(1);
+  }
+
+  const chromePath = detectChromeBinaryPath();
+  if (!chromePath) {
+    throw new Error('Chrome binary not found. Tried: google-chrome-stable, google-chrome, chromium-browser, chromium');
+  }
+
+  const projectRoot = path.join(fs.realpathSync(__dirname), '..');
+  const extensionSourceDir = path.join(projectRoot, 'extension-dist');
+  const setupSchemaDir = path.join(NEO_HOME_DIR, 'schemas');
+
+  fs.mkdirSync(NEO_HOME_DIR, { recursive: true });
+  copyDirectoryRecursive(extensionSourceDir, NEO_EXTENSION_DIR);
+  fs.mkdirSync(setupSchemaDir, { recursive: true });
+
+  const config = {
+    chromePath,
+    cdpPort: 9222,
+  };
+  fs.writeFileSync(NEO_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+  console.log('Neo setup complete');
+  console.log(`  Chrome binary: ${chromePath}`);
+  console.log(`  Extension dir: ${NEO_EXTENSION_DIR}`);
+  console.log(`  Config file: ${NEO_CONFIG_FILE}`);
+  console.log(`  Schema dir: ${setupSchemaDir}`);
+  console.log('');
+  console.log('Launch Chrome with:');
+  console.log(`  ${chromePath} --load-extension=~/.neo/extension --remote-debugging-port=9222`);
+};
+
+// neo start
+commands.start = async function(args) {
+  const { positional, flags } = parseArgs(args || []);
+  if (positional.length > 0 || Object.keys(flags).length > 0) {
+    console.error('Usage: neo start');
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(NEO_CONFIG_FILE)) {
+    throw new Error(`Missing config: ${NEO_CONFIG_FILE}. Run neo setup first`);
+  }
+
+  let config = null;
+  try {
+    config = JSON.parse(fs.readFileSync(NEO_CONFIG_FILE, 'utf8'));
+  } catch {
+    throw new Error(`Invalid config JSON: ${NEO_CONFIG_FILE}`);
+  }
+
+  const chromePath = String(config && config.chromePath || '').trim();
+  const cdpPort = parseInt(String(config && config.cdpPort !== undefined ? config.cdpPort : 9222), 10);
+
+  if (!chromePath) {
+    throw new Error(`Missing chromePath in ${NEO_CONFIG_FILE}. Run neo setup again`);
+  }
+  if (!Number.isInteger(cdpPort) || cdpPort <= 0 || cdpPort > 65535) {
+    throw new Error(`Invalid cdpPort in ${NEO_CONFIG_FILE}: ${config && config.cdpPort}`);
+  }
+  if (!fs.existsSync(NEO_EXTENSION_DIR)) {
+    throw new Error(`Missing extension directory: ${NEO_EXTENSION_DIR}. Run neo setup first`);
+  }
+  if (chromePath.includes('/') && !fs.existsSync(chromePath)) {
+    throw new Error(`Chrome binary does not exist: ${chromePath}`);
+  }
+
+  const child = spawn(chromePath, [
+    `--load-extension=${NEO_EXTENSION_DIR}`,
+    `--remote-debugging-port=${cdpPort}`,
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const ready = await waitForCdpPort(cdpPort, 5000, 250);
+  if (!ready) {
+    console.log(`Failed to start Chrome: CDP endpoint http://localhost:${cdpPort} did not respond within 5s`);
+    process.exit(1);
+  }
+
+  console.log(`Chrome started with Neo extension on port ${cdpPort}`);
+  console.log(`CDP endpoint: http://localhost:${cdpPort}`);
 };
 
 // neo launch <app> [--port N]
@@ -5589,10 +5805,11 @@ commands.doctor = async function() {
   });
 
   check('Neo extension service worker', async () => {
-    const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
-    const sw = tabs.find(t => t.type === 'service_worker' && t.url.includes(NEO_EXTENSION_ID));
+    const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
     if (!sw) throw new Error('Not found — install extension or check NEO_EXTENSION_ID');
-    return `OK (${NEO_EXTENSION_ID.slice(0, 8)}…)`;
+    const extensionId = parseExtensionIdFromUrl(sw.url);
+    if (!extensionId) return 'OK';
+    return `OK (${extensionId.slice(0, 8)}…)`;
   });
 
   check('IndexedDB captures', async () => {
@@ -5650,6 +5867,8 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
+  neo setup                               Setup ~/.neo config, extension, and schemas
+  neo start                               Start Chrome with configured Neo extension
   neo launch <app> [--port N]             Launch Electron app with CDP enabled
   neo connect [port]                      Connect to CDP and save active session
   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
@@ -5692,7 +5911,7 @@ Options (for exec):
 
 Environment:
   NEO_CDP_URL        Chrome DevTools URL (default: http://localhost:9222)
-  NEO_EXTENSION_ID   Neo extension ID
+  NEO_EXTENSION_ID   Neo extension ID override
   NEO_SCHEMA_DIR     Schema storage directory`);
   }
 }

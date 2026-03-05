@@ -46,7 +46,8 @@ const AUTH_HEADER_PATTERNS = [
 const REDACTED_HEADER_VALUE = '[REDACTED]';
 const AUTH_HEADER_REGEX = /token|auth|key|secret|session/i;
 const CDP_URL = 'http://localhost:9222';
-const NEO_EXTENSION_ID = 'ikikhldfkbfmcbandaagjomhchlehjap';
+const NEO_EXTENSION_ID = null;
+const EXTENSION_ID_CACHE_FILE = path.join(os.tmpdir(), `neo-ext-id-test-${process.pid}`);
 const SESSION_FILE = path.join(os.tmpdir(), `neo-sessions-test-${process.pid}.json`);
 const DEFAULT_SESSION_NAME = '__default__';
 const ELECTRON_APPS = Object.freeze({
@@ -222,20 +223,143 @@ function setSession(name = DEFAULT_SESSION_NAME, data = {}) {
   return sessions[name];
 }
 
-async function findExtensionWs(deps = {}) {
+function shellEscape(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function resolveCommandPath(commandName, deps = {}) {
+  const execSyncFn = typeof deps.execSync === 'function' ? deps.execSync : () => '';
+  const name = String(commandName || '').trim();
+  if (!name || name.includes('/')) return null;
+  try {
+    const output = String(execSyncFn(`command -v ${shellEscape(name)}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/sh',
+    }) || '');
+    const resolved = output.trim().split('\n')[0];
+    return resolved || null;
+  } catch {
+    return null;
+  }
+}
+
+function detectChromeBinaryPath(deps = {}) {
+  const resolveCommandPathFn = typeof deps.resolveCommandPath === 'function' ? deps.resolveCommandPath : resolveCommandPath;
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const platform = deps.platform || process.platform;
+  const candidates = ['google-chrome-stable', 'google-chrome', 'chromium-browser', 'chromium'];
+
+  for (const candidate of candidates) {
+    const resolved = resolveCommandPathFn(candidate);
+    if (resolved) return resolved;
+  }
+
+  if (platform === 'darwin') {
+    const macChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    if (existsSyncFn(macChromePath)) return macChromePath;
+  }
+
+  return null;
+}
+
+function copyDirectoryRecursive(sourceDir, destinationDir, deps = {}) {
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : fs.existsSync;
+  const mkdirSyncFn = typeof deps.mkdirSync === 'function' ? deps.mkdirSync : fs.mkdirSync;
+  const readdirSyncFn = typeof deps.readdirSync === 'function' ? deps.readdirSync : fs.readdirSync;
+  const copyFileSyncFn = typeof deps.copyFileSync === 'function' ? deps.copyFileSync : fs.copyFileSync;
+  if (!existsSyncFn(sourceDir)) {
+    throw new Error(`Missing extension source directory: ${sourceDir}`);
+  }
+
+  mkdirSyncFn(destinationDir, { recursive: true });
+  const entries = readdirSyncFn(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(sourceDir, entry.name);
+    const destPath = path.join(destinationDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirectoryRecursive(srcPath, destPath, deps);
+      continue;
+    }
+    if (entry.isFile()) {
+      copyFileSyncFn(srcPath, destPath);
+    }
+  }
+}
+
+function parseExtensionIdFromUrl(url) {
+  const match = String(url || '').match(/^chrome-extension:\/\/([a-z]{32})\//i);
+  if (!match) return null;
+  return match[1].toLowerCase();
+}
+
+function findServiceWorkerByExtensionId(serviceWorkers, extensionId) {
+  const expected = String(extensionId || '').trim().toLowerCase();
+  if (!expected) return null;
+  const workers = Array.isArray(serviceWorkers) ? serviceWorkers : [];
+  for (const worker of workers) {
+    const found = parseExtensionIdFromUrl(worker && worker.url);
+    if (found === expected) return worker;
+  }
+  return null;
+}
+
+async function findExtensionServiceWorker(deps = {}) {
   const fetchFn = typeof deps.fetch === 'function' ? deps.fetch : async () => ({ ok: false, json: async () => [] });
+  const cdpEvalFn = typeof deps.cdpEval === 'function' ? deps.cdpEval : async () => null;
+  const existsSyncFn = typeof deps.existsSync === 'function' ? deps.existsSync : () => false;
+  const readFileSyncFn = typeof deps.readFileSync === 'function' ? deps.readFileSync : () => '';
+  const writeFileSyncFn = typeof deps.writeFileSync === 'function' ? deps.writeFileSync : () => {};
   const cdpUrl = deps.cdpUrl || CDP_URL;
+  const extensionId = deps.extensionId !== undefined ? deps.extensionId : NEO_EXTENSION_ID;
+  const extensionIdCacheFile = deps.extensionIdCacheFile || EXTENSION_ID_CACHE_FILE;
   try {
     const resp = await fetchFn(`${cdpUrl}/json/list`);
     if (!resp || !resp.ok) return null;
     const tabs = await resp.json();
-    const sw = (Array.isArray(tabs) ? tabs : [])
-      .find(t => t.type === 'service_worker' && String(t.url || '').includes(NEO_EXTENSION_ID));
-    if (!sw || !sw.webSocketDebuggerUrl) return null;
-    return sw.webSocketDebuggerUrl;
+    const serviceWorkers = (Array.isArray(tabs) ? tabs : [])
+      .filter(t => t && t.type === 'service_worker' && typeof t.webSocketDebuggerUrl === 'string' && t.webSocketDebuggerUrl.trim());
+
+    if (extensionId) {
+      return findServiceWorkerByExtensionId(serviceWorkers, extensionId);
+    }
+
+    let cachedExtensionId = '';
+    try {
+      if (existsSyncFn(extensionIdCacheFile)) {
+        cachedExtensionId = String(readFileSyncFn(extensionIdCacheFile, 'utf8') || '').trim();
+      }
+    } catch {}
+
+    if (cachedExtensionId) {
+      const cachedWorker = findServiceWorkerByExtensionId(serviceWorkers, cachedExtensionId);
+      if (cachedWorker) return cachedWorker;
+    }
+
+    for (const worker of serviceWorkers) {
+      try {
+        const manifestName = await cdpEvalFn(worker.webSocketDebuggerUrl, 'chrome.runtime.getManifest().name', 5000);
+        if (manifestName !== 'Neo') continue;
+        const discoveredId = parseExtensionIdFromUrl(worker.url);
+        if (discoveredId) {
+          try {
+            writeFileSyncFn(extensionIdCacheFile, `${discoveredId}\n`, 'utf8');
+          } catch {}
+        }
+        return worker;
+      } catch {}
+    }
+
+    return null;
   } catch {
     return null;
   }
+}
+
+async function findExtensionWs(deps = {}) {
+  const worker = await findExtensionServiceWorker(deps);
+  if (!worker || !worker.webSocketDebuggerUrl) return null;
+  return worker.webSocketDebuggerUrl;
 }
 
 async function isSessionMode(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
@@ -1008,14 +1132,36 @@ test('findExtensionWs returns null when CDP fetch throws', async () => {
   assert.strictEqual(wsUrl, null);
 });
 
-test('findExtensionWs selects matching extension service worker', async () => {
+test('findExtensionWs selects matching extension service worker via manifest probe', async () => {
   const wsUrl = await findExtensionWs({
     fetch: async () => ({
       ok: true,
       json: async () => ([
         { type: 'page', url: 'https://example.com', webSocketDebuggerUrl: 'ws://page' },
-        { type: 'service_worker', url: `chrome-extension://${NEO_EXTENSION_ID}/background.js`, webSocketDebuggerUrl: 'ws://sw-neo' },
-        { type: 'service_worker', url: 'chrome-extension://other/background.js', webSocketDebuggerUrl: 'ws://sw-other' },
+        { type: 'service_worker', url: 'chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef/background.js', webSocketDebuggerUrl: 'ws://sw-neo' },
+        { type: 'service_worker', url: 'chrome-extension://otherotherotherotherotherotheroo/background.js', webSocketDebuggerUrl: 'ws://sw-other' },
+      ]),
+    }),
+    cdpEval: async (wsUrl) => {
+      if (wsUrl === 'ws://sw-neo') return 'Neo';
+      return 'Other Extension';
+    },
+    existsSync: () => false,
+    readFileSync: () => '',
+    writeFileSync: () => {},
+    extensionIdCacheFile: '/tmp/neo-ext-id-test-' + process.pid,
+  });
+  assert.strictEqual(wsUrl, 'ws://sw-neo');
+});
+
+test('findExtensionWs selects by explicit extension ID when set', async () => {
+  const wsUrl = await findExtensionWs({
+    extensionId: 'abcdefghijklmnopqrstuvwxyzabcdef',
+    fetch: async () => ({
+      ok: true,
+      json: async () => ([
+        { type: 'service_worker', url: 'chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef/background.js', webSocketDebuggerUrl: 'ws://sw-neo' },
+        { type: 'service_worker', url: 'chrome-extension://otherotherotherotherotherotheroo/background.js', webSocketDebuggerUrl: 'ws://sw-other' },
       ]),
     }),
   });
