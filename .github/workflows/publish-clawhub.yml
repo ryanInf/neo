@@ -1,0 +1,30 @@
+name: Publish to ClawHub
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install ClawHub CLI
+        run: npm i -g clawhub
+
+      - name: Publish skill
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          clawhub publish ./skill \
+            --slug neo-browser \
+            --name "Neo — Web App API Discovery" \
+            --version "$VERSION" \
+            --changelog "Release ${GITHUB_REF_NAME}"
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
