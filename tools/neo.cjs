@@ -58,7 +58,13 @@ const SCHEMA_DIR = process.env.NEO_SCHEMA_DIR || path.join(process.env.HOME, '.n
 const WORKFLOW_FILE_EXT = '.workflows.json';
 const SESSION_FILE = '/tmp/neo-sessions.json';
 const EXTENSION_ID_CACHE_FILE = '/tmp/neo-ext-id';
-const NEO_HOME_DIR = path.join(process.env.HOME, '.neo');
+const NEO_BASE_DIR = path.join(process.env.HOME, '.neo');
+const NEO_PROFILE = process.env.NEO_PROFILE || null;
+function getNeoHomeDir(profile) {
+  const p = profile || NEO_PROFILE;
+  return p ? path.join(NEO_BASE_DIR, 'profiles', p) : NEO_BASE_DIR;
+}
+const NEO_HOME_DIR = getNeoHomeDir();
 const NEO_CONFIG_FILE = path.join(NEO_HOME_DIR, 'config.json');
 const NEO_EXTENSION_DIR = path.join(NEO_HOME_DIR, 'extension');
 const DEFAULT_SESSION_NAME = '__default__';
@@ -2402,13 +2408,42 @@ commands.version = function() {
   console.log(`neo v${pkg.version}`);
 };
 
-// neo setup
+// neo profiles — list configured profiles
+commands.profiles = function() {
+  const profilesDir = path.join(NEO_BASE_DIR, 'profiles');
+  const profiles = [];
+  if (fs.existsSync(profilesDir)) {
+    for (const name of fs.readdirSync(profilesDir)) {
+      const configPath = path.join(profilesDir, name, 'config.json');
+      if (fs.existsSync(configPath)) {
+        profiles.push(name);
+      }
+    }
+  }
+  const defaultExists = fs.existsSync(NEO_CONFIG_FILE);
+  if (defaultExists) console.log(`  default  ${NEO_HOME_DIR}`);
+  for (const name of profiles) {
+    console.log(`  ${name.padEnd(9)} ${path.join(profilesDir, name)}`);
+  }
+  if (!defaultExists && profiles.length === 0) {
+    console.log('No profiles configured. Run neo setup to create default profile.');
+  }
+};
+
+// neo setup [--profile <name>]
 commands.setup = async function(args) {
   const { positional, flags } = parseArgs(args || []);
-  if (positional.length > 0 || Object.keys(flags).length > 0) {
-    console.error('Usage: neo setup');
+  const profileName = typeof flags.profile === 'string' ? flags.profile : null;
+  if (positional.length > 0 || (Object.keys(flags).length > 0 && !('profile' in flags))) {
+    console.error('Usage: neo setup [--profile <name>]');
     process.exit(1);
   }
+
+  // If profile specified, override home dir for this run
+  const homeDir = profileName ? getNeoHomeDir(profileName) : NEO_HOME_DIR;
+  const configFile = path.join(homeDir, 'config.json');
+  const extensionDir = path.join(homeDir, 'extension');
+  const setupSchemaDir = path.join(homeDir, 'schemas');
 
   const chromePath = detectChromeBinaryPath();
   if (!chromePath) {
@@ -2417,20 +2452,20 @@ commands.setup = async function(args) {
 
   const projectRoot = path.join(fs.realpathSync(__dirname), '..');
   const extensionSourceDir = path.join(projectRoot, 'extension-dist');
-  const setupSchemaDir = path.join(NEO_HOME_DIR, 'schemas');
 
-  fs.mkdirSync(NEO_HOME_DIR, { recursive: true });
-  copyDirectoryRecursive(extensionSourceDir, NEO_EXTENSION_DIR);
+  fs.mkdirSync(homeDir, { recursive: true });
+  copyDirectoryRecursive(extensionSourceDir, extensionDir);
   fs.mkdirSync(setupSchemaDir, { recursive: true });
 
   const config = {
     chromePath,
     cdpPort: 9222,
   };
-  fs.writeFileSync(NEO_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  if (profileName) config.profile = profileName;
+  fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
   // Pre-register Neo extension in Chrome Preferences (zero-config install)
-  const profileDefaultDir = path.join(NEO_HOME_DIR, 'chrome-profile', 'Default');
+  const profileDefaultDir = path.join(homeDir, 'chrome-profile', 'Default');
   const prefsFile = path.join(profileDefaultDir, 'Preferences');
   fs.mkdirSync(profileDefaultDir, { recursive: true });
   let prefs = {};
@@ -2447,12 +2482,12 @@ commands.setup = async function(args) {
 
   // Generate deterministic extension ID from path (same algorithm Chrome uses for unpacked)
   const crypto = require('crypto');
-  const extRealPath = fs.realpathSync(NEO_EXTENSION_DIR);
+  const extRealPath = fs.realpathSync(extensionDir);
   const hashHex = crypto.createHash('sha256').update(extRealPath).digest('hex').slice(0, 32);
   const extensionId = [...hashHex].map(c => String.fromCharCode('a'.charCodeAt(0) + parseInt(c, 16))).join('');
 
   // Read extension manifest for permissions
-  const manifest = JSON.parse(fs.readFileSync(path.join(NEO_EXTENSION_DIR, 'manifest.json'), 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8'));
   const permissions = manifest.permissions || [];
 
   // Register as unpacked extension (location: 4)
@@ -2491,51 +2526,54 @@ commands.setup = async function(args) {
   fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2) + '\n', 'utf8');
 
   console.log('Neo setup complete');
+  if (profileName) console.log(`  Profile: ${profileName}`);
   console.log(`  Chrome binary: ${chromePath}`);
-  console.log(`  Extension dir: ${NEO_EXTENSION_DIR}`);
+  console.log(`  Extension dir: ${extensionDir}`);
   console.log(`  Extension ID: ${extensionId}`);
-  console.log(`  Config file: ${NEO_CONFIG_FILE}`);
+  console.log(`  Config file: ${configFile}`);
   console.log(`  Schema dir: ${setupSchemaDir}`);
   console.log('');
   console.log('Launch Chrome with: neo start');
 };
 
-// neo start
+// neo start [--profile <name>] [--force]
 commands.start = async function(args) {
   const { positional, flags } = parseArgs(args || []);
-  if (positional.length > 0 || Object.keys(flags).length > 0) {
-    console.error('Usage: neo start');
-    process.exit(1);
-  }
+  const profileName = typeof flags.profile === 'string' ? flags.profile : null;
+  const force = 'force' in flags;
 
-  if (!fs.existsSync(NEO_CONFIG_FILE)) {
-    throw new Error(`Missing config: ${NEO_CONFIG_FILE}. Run neo setup first`);
+  const homeDir = profileName ? getNeoHomeDir(profileName) : NEO_HOME_DIR;
+  const configFile = path.join(homeDir, 'config.json');
+  const extensionDir = path.join(homeDir, 'extension');
+
+  if (!fs.existsSync(configFile)) {
+    throw new Error(`Missing config: ${configFile}. Run neo setup${profileName ? ' --profile ' + profileName : ''} first`);
   }
 
   let config = null;
   try {
-    config = JSON.parse(fs.readFileSync(NEO_CONFIG_FILE, 'utf8'));
+    config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
   } catch {
-    throw new Error(`Invalid config JSON: ${NEO_CONFIG_FILE}`);
+    throw new Error(`Invalid config JSON: ${configFile}`);
   }
 
   const chromePath = String(config && config.chromePath || '').trim();
   const cdpPort = parseInt(String(config && config.cdpPort !== undefined ? config.cdpPort : 9222), 10);
 
   if (!chromePath) {
-    throw new Error(`Missing chromePath in ${NEO_CONFIG_FILE}. Run neo setup again`);
+    throw new Error(`Missing chromePath in ${configFile}. Run neo setup again`);
   }
   if (!Number.isInteger(cdpPort) || cdpPort <= 0 || cdpPort > 65535) {
-    throw new Error(`Invalid cdpPort in ${NEO_CONFIG_FILE}: ${config && config.cdpPort}`);
+    throw new Error(`Invalid cdpPort in ${configFile}: ${config && config.cdpPort}`);
   }
-  if (!fs.existsSync(NEO_EXTENSION_DIR)) {
-    throw new Error(`Missing extension directory: ${NEO_EXTENSION_DIR}. Run neo setup first`);
+  if (!fs.existsSync(extensionDir)) {
+    throw new Error(`Missing extension directory: ${extensionDir}. Run neo setup first`);
   }
   if (chromePath.includes('/') && !fs.existsSync(chromePath)) {
     throw new Error(`Chrome binary does not exist: ${chromePath}`);
   }
 
-  const userDataDir = String(config && config.userDataDir || '').trim() || path.join(NEO_HOME_DIR, 'chrome-profile');
+  const userDataDir = String(config && config.userDataDir || '').trim() || path.join(homeDir, 'chrome-profile');
   fs.mkdirSync(userDataDir, { recursive: true });
 
   const child = spawn(chromePath, [
@@ -6049,14 +6087,22 @@ commands.reload = async function() {
 };
 
 // neo doctor — diagnose setup issues
-commands.doctor = async function() {
+commands.doctor = async function(args) {
+  const fix = (args || []).includes('--fix');
   const checks = [];
-  function check(name, fn) { checks.push({ name, fn }); }
+  function check(name, fn, fixFn) { checks.push({ name, fn, fixFn }); }
 
   check('Chrome CDP endpoint', async () => {
     const resp = await fetch(`${CDP_URL}/json/version`);
     const info = await resp.json();
     return `${info.Browser} (${CDP_URL})`;
+  }, async () => {
+    process.stderr.write('  → Starting Chrome with neo start...\n');
+    await commands.start([]);
+    await new Promise(r => setTimeout(r, 2000));
+    const resp = await fetch(`${CDP_URL}/json/version`);
+    const info = await resp.json();
+    return `Fixed: ${info.Browser} (${CDP_URL})`;
   });
 
   check('Browser tabs', async () => {
@@ -6071,6 +6117,15 @@ commands.doctor = async function() {
     const extensionId = parseExtensionIdFromUrl(sw.url);
     if (!extensionId) return 'OK';
     return `OK (${extensionId.slice(0, 8)}…)`;
+  }, async () => {
+    process.stderr.write('  → Running neo setup to install extension...\n');
+    await commands.setup([]);
+    process.stderr.write('  → Restarting Chrome...\n');
+    await commands.start(['--force']);
+    await new Promise(r => setTimeout(r, 3000));
+    const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
+    if (!sw) throw new Error('Still not found after fix');
+    return 'Fixed: extension installed and loaded';
   });
 
   check('IndexedDB captures', async () => {
@@ -6085,6 +6140,9 @@ commands.doctor = async function() {
     if (!fs.existsSync(SCHEMA_DIR)) throw new Error(`Missing: ${SCHEMA_DIR}`);
     const files = fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json'));
     return `${files.length} schema(s) in ${SCHEMA_DIR}`;
+  }, async () => {
+    fs.mkdirSync(SCHEMA_DIR, { recursive: true });
+    return `Fixed: created ${SCHEMA_DIR}`;
   });
 
   check('WebSocket bridge port', async () => {
@@ -6096,14 +6154,26 @@ commands.doctor = async function() {
     });
   });
 
-  for (const { name, fn } of checks) {
+  let fixed = 0;
+  for (const { name, fn, fixFn } of checks) {
     try {
       const result = await fn();
       console.log(`  ✓  ${name}: ${result}`);
     } catch (err) {
-      console.log(`  ✗  ${name}: ${err.message}`);
+      if (fix && fixFn) {
+        try {
+          const result = await fixFn();
+          console.log(`  ✓  ${name}: ${result}`);
+          fixed++;
+        } catch (fixErr) {
+          console.log(`  ✗  ${name}: ${fixErr.message}`);
+        }
+      } else {
+        console.log(`  ✗  ${name}: ${err.message}${fixFn ? ' (use --fix to auto-repair)' : ''}`);
+      }
     }
   }
+  if (fix && fixed > 0) console.log(`\n  Fixed ${fixed} issue(s).`);
 };
 
 async function main() {
@@ -6128,8 +6198,9 @@ Commands:
   neo eval "<js>" --tab <pattern>         Evaluate JS in page context
   neo open <url>                          Open URL in Chrome
   neo read <tab-pattern>                  Extract readable text from page
-  neo setup                               Setup ~/.neo config, extension, and schemas
-  neo start                               Start Chrome with configured Neo extension
+  neo setup [--profile <name>]             Setup ~/.neo config, extension, and schemas
+  neo start [--profile <name>]             Start Chrome with configured Neo extension
+  neo profiles                             List configured profiles
   neo launch <app> [--port N]             Launch Electron app with CDP enabled
   neo connect [port]                      Connect to CDP and save active session
   neo connect --electron <app-name>       Auto-discover Electron CDP port and connect
@@ -6159,7 +6230,7 @@ Commands:
   neo export-skill <domain>               Generate agent-ready API reference
   neo mock <domain> [--port N]            Generate mock server from schema
   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge server
-  neo doctor                              Diagnose setup issues
+  neo doctor [--fix]                      Diagnose setup issues (--fix to auto-repair)
   neo reload                              Reload the Neo extension
 
 Options (for exec):
