@@ -1997,6 +1997,104 @@ test('getSelector returns #id when present', () => {
   assert.strictEqual(getSelector(el), '#main');
 });
 
+// ─── parseSnapshotArgs ──────────────────────────────────
+function parseSnapshotArgs(argv) {
+  const options = {
+    interactiveOnly: false,
+    includeCursorPointer: false,
+    json: false,
+    diff: false,
+    selector: null,
+  };
+  const unknown = [];
+  const args = Array.isArray(argv) ? argv : [];
+  for (let i = 0; i < args.length; i++) {
+    const current = args[i];
+    if (current === '-i') { options.interactiveOnly = true; continue; }
+    if (current === '-C') { options.includeCursorPointer = true; continue; }
+    if (current === '--json') { options.json = true; continue; }
+    if (current === '--diff') { options.diff = true; continue; }
+    if (current === '--selector') {
+      if (args[i + 1] && !args[i + 1].startsWith('-')) { options.selector = args[i + 1]; i++; }
+      else { unknown.push(current); }
+      continue;
+    }
+    if (current.startsWith('--selector=')) { options.selector = current.slice('--selector='.length); continue; }
+    unknown.push(current);
+  }
+  return { options, unknown };
+}
+
+console.log('\nparseSnapshotArgs:');
+test('parseSnapshotArgs recognizes --diff flag', () => {
+  const { options, unknown } = parseSnapshotArgs(['--diff', '-i', '--json']);
+  assert.strictEqual(options.diff, true);
+  assert.strictEqual(options.interactiveOnly, true);
+  assert.strictEqual(options.json, true);
+  assert.strictEqual(unknown.length, 0);
+});
+
+test('parseSnapshotArgs defaults diff to false', () => {
+  const { options } = parseSnapshotArgs(['-i']);
+  assert.strictEqual(options.diff, false);
+});
+
+console.log('\nsnapshot diff logic:');
+test('diff detects added and removed nodes', () => {
+  const prev = [
+    { ref: '@e1', role: 'button', name: 'Save', depth: 0 },
+    { ref: '@e2', role: 'link', name: 'Home', depth: 0 },
+  ];
+  const curr = [
+    { ref: '@e1', role: 'button', name: 'Save', depth: 0 },
+    { ref: '@e3', role: 'textbox', name: 'Search', depth: 1 },
+  ];
+  const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
+  const currMap = new Map(curr.map(n => [`${n.role}:${n.name}`, n]));
+  const added = curr.filter(n => !prevMap.has(`${n.role}:${n.name}`));
+  const removed = prev.filter(n => !currMap.has(`${n.role}:${n.name}`));
+  assert.strictEqual(added.length, 1);
+  assert.strictEqual(added[0].name, 'Search');
+  assert.strictEqual(removed.length, 1);
+  assert.strictEqual(removed[0].name, 'Home');
+});
+
+test('diff detects changed depth', () => {
+  const prev = [
+    { ref: '@e1', role: 'button', name: 'Submit', depth: 0 },
+  ];
+  const curr = [
+    { ref: '@e1', role: 'button', name: 'Submit', depth: 2 },
+  ];
+  const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
+  const changed = curr.filter(n => {
+    const p = prevMap.get(`${n.role}:${n.name}`);
+    return p && p.depth !== n.depth;
+  });
+  assert.strictEqual(changed.length, 1);
+  assert.strictEqual(changed[0].name, 'Submit');
+});
+
+test('diff reports no changes for identical snapshots', () => {
+  const prev = [
+    { ref: '@e1', role: 'button', name: 'OK', depth: 0 },
+  ];
+  const curr = [
+    { ref: '@e1', role: 'button', name: 'OK', depth: 0 },
+  ];
+  const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
+  const currMap = new Map(curr.map(n => [`${n.role}:${n.name}`, n]));
+  const added = curr.filter(n => !prevMap.has(`${n.role}:${n.name}`));
+  const removed = prev.filter(n => !currMap.has(`${n.role}:${n.name}`));
+  const changed = curr.filter(n => {
+    const p = prevMap.get(`${n.role}:${n.name}`);
+    return p && p.depth !== n.depth;
+  });
+  assert.strictEqual(added.length, 0);
+  assert.strictEqual(removed.length, 0);
+  assert.strictEqual(changed.length, 0);
+});
+
 Promise.all(pendingTests)
   .finally(() => {
     resetSessionFile();

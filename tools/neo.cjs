@@ -28,7 +28,7 @@
 //   neo tab                                 List CDP targets in the active session
 //   neo tab <index> | neo tab --url <pat>  Switch active tab target
 //   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
-//   neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+//   neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with @ref mapping
 //   neo click @ref [--new-tab]              Click element by @ref
 //   neo fill @ref "text"                     Clear then fill element by @ref
 //   neo type @ref "text"                     Type text without clearing
@@ -2151,6 +2151,7 @@ function parseSnapshotArgs(argv) {
     interactiveOnly: false,
     includeCursorPointer: false,
     json: false,
+    diff: false,
     selector: null,
   };
   const unknown = [];
@@ -2168,6 +2169,10 @@ function parseSnapshotArgs(argv) {
     }
     if (current === '--json') {
       options.json = true;
+      continue;
+    }
+    if (current === '--diff') {
+      options.diff = true;
       continue;
     }
     if (current === '--selector') {
@@ -2781,11 +2786,11 @@ commands.inject = async function(args, context = {}) {
   console.log(`Injected Neo capture script${persisted}`);
 };
 
-// neo snapshot [-i] [-C] [--json] [--selector css]
+// neo snapshot [-i] [-C] [--json] [--diff] [--selector css]
 commands.snapshot = async function(args, context = {}) {
   const { options, unknown } = parseSnapshotArgs(args || []);
   if (unknown.length > 0) {
-    console.error('Usage: neo snapshot [-i] [-C] [--json] [--selector css]');
+    console.error('Usage: neo snapshot [-i] [-C] [--json] [--diff] [--selector css]');
     process.exit(1);
   }
 
@@ -2803,11 +2808,12 @@ commands.snapshot = async function(args, context = {}) {
   const displayNodes = options.interactiveOnly
     ? assigned.nodes.filter(node => INTERACTIVE_ROLES.has(String(node.role || '').toLowerCase()))
     : assigned.nodes;
-
-  setSession(sessionName, {
-    ...session,
-    refs: assigned.refs,
-  });
+  const storedSnapshot = displayNodes.map(node => ({
+    ref: node.ref,
+    role: node.role,
+    name: node.name,
+    depth: node.depth,
+  }));
 
   if (options.includeCursorPointer) {
     // TODO: Add Runtime.evaluate scan for cursor:pointer elements.
@@ -2817,6 +2823,59 @@ commands.snapshot = async function(args, context = {}) {
     // TODO: Add CSS selector scoped snapshot filtering.
     console.error('TODO: snapshot --selector is not implemented yet');
   }
+
+  if (options.diff) {
+    const prev = Array.isArray(session.prevSnapshot) ? session.prevSnapshot : [];
+    const prevMap = new Map(prev.map(node => [`${node.role}:${node.name}`, node]));
+    const currMap = new Map(displayNodes.map(node => [`${node.role}:${node.name}`, node]));
+
+    const added = displayNodes.filter(node => !prevMap.has(`${node.role}:${node.name}`));
+    const removed = prev.filter(node => !currMap.has(`${node.role}:${node.name}`));
+    const changed = displayNodes.filter((node) => {
+      const previousNode = prevMap.get(`${node.role}:${node.name}`);
+      return previousNode && previousNode.depth !== node.depth;
+    });
+
+    const latestSession = getSession(sessionName) || session || {};
+    setSession(sessionName, {
+      ...latestSession,
+      refs: assigned.refs,
+      prevSnapshot: storedSnapshot,
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify({ added, removed, changed }, null, 2));
+      return;
+    }
+
+    const lines = [];
+    if (added.length) {
+      lines.push(`+ Added (${added.length}):`);
+      lines.push(formatSnapshot(added));
+    }
+    if (removed.length) {
+      lines.push(`- Removed (${removed.length}):`);
+      for (const node of removed) {
+        const indent = '  '.repeat(node.depth || 0);
+        lines.push(`  ${indent}${node.ref}  [${node.role}] "${node.name}"`);
+      }
+    }
+    if (changed.length) {
+      lines.push(`~ Changed (${changed.length}):`);
+      lines.push(formatSnapshot(changed));
+    }
+    if (lines.length === 0) {
+      lines.push('(no changes)');
+    }
+    console.log(lines.join('\n'));
+    return;
+  }
+
+  setSession(sessionName, {
+    ...session,
+    refs: assigned.refs,
+    prevSnapshot: storedSnapshot,
+  });
 
   if (options.json) {
     const refs = {};
@@ -5943,7 +6002,7 @@ Commands:
   neo tab                                 List CDP targets in the active session
   neo tab <index> | neo tab --url <pat>  Switch active tab target
   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
-  neo snapshot [-i] [-C] [--json]         Snapshot a11y tree with @ref mapping
+  neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with @ref mapping
   neo click @ref [--new-tab]              Click element by @ref
   neo fill @ref "text"                     Clear then fill element by @ref
   neo type @ref "text"                     Type text without clearing
