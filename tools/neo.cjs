@@ -4861,11 +4861,13 @@ commands.read = async function(args) {
 
 commands.bridge = async function(args) {
   const { WebSocketServer } = require('ws');
+  const http = require('http');
   const port = parseInt(args.find(a => /^\d+$/.test(a)) || '9234', 10);
   const json = args.includes('--json');
   const quiet = args.includes('--quiet');
+  const wsOnly = args.includes('--ws-only');
 
-  const wss = new WebSocketServer({ port });
+  const wss = new WebSocketServer({ noServer: true });
   const clients = new Set();
   const pendingResponses = new Map(); // id → { resolve, timer }
   let cmdIdCounter = 0;
@@ -4883,8 +4885,142 @@ commands.bridge = async function(args) {
 
   if (!quiet) {
     process.stderr.write(`[Neo Bridge] listening on ws://127.0.0.1:${port}\n`);
+    if (!wsOnly) process.stderr.write(`[Neo Bridge] REST API at http://127.0.0.1:${port}\n`);
     process.stderr.write(`[Neo Bridge] waiting for extension to connect...\n`);
   }
+
+  // ─── HTTP REST handler ───────────────────────────────────
+  function jsonResponse(res, status, data) {
+    const body = JSON.stringify(data, null, 2);
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(body);
+  }
+
+  function readBody(req) {
+    return new Promise((resolve) => {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => resolve(body));
+    });
+  }
+
+  async function handleHttpRequest(req, res) {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      });
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url, 'http://localhost');
+    const pathname = url.pathname;
+
+    try {
+      // GET /status
+      if (pathname === '/status' && req.method === 'GET') {
+        return jsonResponse(res, 200, { ok: true, data: { clients: clients.size, uptime: process.uptime() } });
+      }
+
+      // GET /captures?domain=...&limit=...
+      if (pathname === '/captures' && req.method === 'GET') {
+        const cmdArgs = {};
+        if (url.searchParams.has('domain')) cmdArgs.domain = url.searchParams.get('domain');
+        if (url.searchParams.has('limit')) cmdArgs.limit = parseInt(url.searchParams.get('limit'));
+        const resp = await sendCommand('capture.list', cmdArgs);
+        return jsonResponse(res, 200, { ok: true, data: resp.result });
+      }
+
+      // GET /captures/count
+      if (pathname === '/captures/count' && req.method === 'GET') {
+        const resp = await sendCommand('capture.count', {});
+        return jsonResponse(res, 200, { ok: true, data: resp.result });
+      }
+
+      // GET /captures/domains
+      if (pathname === '/captures/domains' && req.method === 'GET') {
+        const resp = await sendCommand('capture.domains', {});
+        return jsonResponse(res, 200, { ok: true, data: resp.result });
+      }
+
+      // GET /tabs
+      if (pathname === '/tabs' && req.method === 'GET') {
+        const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
+        const pages = tabs.filter(t => t.type === 'page');
+        return jsonResponse(res, 200, { ok: true, data: pages.map(t => ({ title: t.title, url: t.url, id: t.id })) });
+      }
+
+      // GET /schemas
+      if (pathname === '/schemas' && req.method === 'GET') {
+        const files = fs.existsSync(SCHEMA_DIR) ? fs.readdirSync(SCHEMA_DIR).filter(f => f.endsWith('.json')) : [];
+        const schemas = files.map(f => f.replace('.json', ''));
+        return jsonResponse(res, 200, { ok: true, data: schemas });
+      }
+
+      // GET /schemas/:domain
+      if (pathname.startsWith('/schemas/') && req.method === 'GET') {
+        const domain = pathname.slice('/schemas/'.length);
+        const schemaPath = path.join(SCHEMA_DIR, `${domain}.json`);
+        if (!fs.existsSync(schemaPath)) {
+          return jsonResponse(res, 404, { ok: false, error: `No schema for ${domain}` });
+        }
+        const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+        return jsonResponse(res, 200, { ok: true, data: schema });
+      }
+
+      // GET /snapshot?interactive=true
+      if (pathname === '/snapshot' && req.method === 'GET') {
+        const sessionName = DEFAULT_SESSION_NAME;
+        const session = getSession(sessionName);
+        if (!session || !session.pageWsUrl) {
+          return jsonResponse(res, 400, { ok: false, error: 'No active session. Run neo connect first.' });
+        }
+        await cdpSend(session.pageWsUrl, 'Accessibility.enable');
+        const treeResult = await cdpSend(session.pageWsUrl, 'Accessibility.getFullAXTree');
+        const assigned = assignRefs(treeResult && Array.isArray(treeResult.nodes) ? treeResult.nodes : []);
+        const interactiveOnly = url.searchParams.get('interactive') === 'true';
+        const nodes = interactiveOnly
+          ? assigned.nodes.filter(node => INTERACTIVE_ROLES.has(String(node.role || '').toLowerCase()))
+          : assigned.nodes;
+        setSession(sessionName, { ...session, refs: assigned.refs });
+        return jsonResponse(res, 200, { ok: true, data: { count: nodes.length, nodes } });
+      }
+
+      // POST /eval  { expression: "..." }
+      if (pathname === '/eval' && req.method === 'POST') {
+        const body = JSON.parse(await readBody(req));
+        const sessionName = DEFAULT_SESSION_NAME;
+        const session = getSession(sessionName);
+        if (!session || !session.pageWsUrl) {
+          return jsonResponse(res, 400, { ok: false, error: 'No active session' });
+        }
+        const result = await cdpSend(session.pageWsUrl, 'Runtime.evaluate', {
+          expression: body.expression,
+          returnByValue: true,
+        });
+        return jsonResponse(res, 200, { ok: true, data: result.result });
+      }
+
+      return jsonResponse(res, 404, { ok: false, error: 'Not found' });
+    } catch (err) {
+      return jsonResponse(res, 500, { ok: false, error: err.message });
+    }
+  }
+
+  // ─── HTTP Server + WebSocket upgrade ─────────────────────
+  const server = http.createServer(wsOnly ? (req, res) => {
+    jsonResponse(res, 404, { ok: false, error: 'REST disabled (--ws-only)' });
+  } : handleHttpRequest);
+
+  server.on('upgrade', (req, socket, head) => {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  });
+
+  server.listen(port);
 
   wss.on('connection', (ws) => {
     clients.add(ws);
