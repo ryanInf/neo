@@ -2457,15 +2457,31 @@ commands.setup = async function(args) {
   copyDirectoryRecursive(extensionSourceDir, extensionDir);
   fs.mkdirSync(setupSchemaDir, { recursive: true });
 
+  // Detect user-data-dir from running Chrome process
+  let detectedUserDataDir = null;
+  try {
+    const { execSync: es } = require('child_process');
+    const psOut = es('ps aux', { encoding: 'utf8', timeout: 3000 });
+    for (const line of psOut.split('\n')) {
+      if (/chrome.*--remote-debugging-port/.test(line)) {
+        const m = line.match(/--user-data-dir=(\S+)/);
+        if (m) { detectedUserDataDir = m[1]; break; }
+      }
+    }
+  } catch {}
+
   const config = {
     chromePath,
     cdpPort: 9222,
   };
+  if (detectedUserDataDir) config.userDataDir = detectedUserDataDir;
   if (profileName) config.profile = profileName;
   fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-  // Pre-register Neo extension in Chrome Preferences (zero-config install)
-  const profileDefaultDir = path.join(homeDir, 'chrome-profile', 'Default');
+  // Pre-register Neo extension in Chrome Preferences
+  // Use detected user-data-dir if available, otherwise fall back to neo's own profile
+  const chromeProfileDir = detectedUserDataDir || path.join(homeDir, 'chrome-profile');
+  const profileDefaultDir = path.join(chromeProfileDir, 'Default');
   const prefsFile = path.join(profileDefaultDir, 'Preferences');
   fs.mkdirSync(profileDefaultDir, { recursive: true });
   let prefs = {};
@@ -2528,12 +2544,18 @@ commands.setup = async function(args) {
   console.log('Neo setup complete');
   if (profileName) console.log(`  Profile: ${profileName}`);
   console.log(`  Chrome binary: ${chromePath}`);
+  if (detectedUserDataDir) console.log(`  Chrome user-data-dir: ${detectedUserDataDir} (detected from running Chrome)`);
   console.log(`  Extension dir: ${extensionDir}`);
   console.log(`  Extension ID: ${extensionId}`);
   console.log(`  Config file: ${configFile}`);
   console.log(`  Schema dir: ${setupSchemaDir}`);
   console.log('');
-  console.log('Launch Chrome with: neo start');
+  if (detectedUserDataDir) {
+    console.log('Extension registered in your Chrome profile. Restart Chrome to activate:');
+    console.log('  neo start --force');
+  } else {
+    console.log('Launch Chrome with: neo start');
+  }
 };
 
 // neo start [--profile <name>] [--force]
@@ -2571,6 +2593,22 @@ commands.start = async function(args) {
   }
   if (chromePath.includes('/') && !fs.existsSync(chromePath)) {
     throw new Error(`Chrome binary does not exist: ${chromePath}`);
+  }
+
+  // Check if Chrome is already running with CDP on the target port
+  if (!force) {
+    try {
+      const resp = await fetch(`http://localhost:${cdpPort}/json/version`);
+      if (resp.ok) {
+        const info = await resp.json();
+        console.log(`Chrome already running with CDP on port ${cdpPort} (${info.Browser})`);
+        console.log(`CDP endpoint: http://localhost:${cdpPort}`);
+        console.log('Use --force to launch a new instance anyway.');
+        return;
+      }
+    } catch {
+      // CDP not reachable, proceed to launch
+    }
   }
 
   const userDataDir = String(config && config.userDataDir || '').trim() || path.join(homeDir, 'chrome-profile');
@@ -6090,7 +6128,7 @@ commands.reload = async function() {
 commands.doctor = async function(args) {
   const fix = (args || []).includes('--fix');
   const checks = [];
-  function check(name, fn, fixFn) { checks.push({ name, fn, fixFn }); }
+  function check(name, fn, fixFn, opts) { checks.push({ name, fn, fixFn, critical: opts && opts.critical }); }
 
   check('Chrome CDP endpoint', async () => {
     const resp = await fetch(`${CDP_URL}/json/version`);
@@ -6103,13 +6141,13 @@ commands.doctor = async function(args) {
     const resp = await fetch(`${CDP_URL}/json/version`);
     const info = await resp.json();
     return `Fixed: ${info.Browser} (${CDP_URL})`;
-  });
+  }, { critical: true });
 
   check('Browser tabs', async () => {
     const tabs = await (await fetch(`${CDP_URL}/json/list`)).json();
     const pages = tabs.filter(t => t.type === 'page');
     return `${pages.length} page(s), ${tabs.length} total targets`;
-  });
+  }, null, { critical: false });
 
   check('Neo extension service worker', async () => {
     const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
@@ -6126,7 +6164,7 @@ commands.doctor = async function(args) {
     const sw = await findExtensionServiceWorker({ cdpUrl: CDP_URL });
     if (!sw) throw new Error('Still not found after fix');
     return 'Fixed: extension installed and loaded';
-  });
+  }, { critical: true });
 
   check('IndexedDB captures', async () => {
     const wsUrl = await findExtensionWs();
@@ -6155,25 +6193,48 @@ commands.doctor = async function(args) {
   });
 
   let fixed = 0;
-  for (const { name, fn, fixFn } of checks) {
+  const status = { ready: true, chrome: false, extension: false, captures: null, actions: [] };
+  for (const { name, fn, fixFn, critical } of checks) {
     try {
       const result = await fn();
       console.log(`  ✓  ${name}: ${result}`);
+      if (name === 'Chrome CDP endpoint') status.chrome = true;
+      if (name === 'Neo extension service worker') status.extension = true;
+      if (name === 'IndexedDB captures') {
+        const m = String(result).match(/^(\d+)/);
+        status.captures = m ? parseInt(m[1], 10) : 0;
+      }
     } catch (err) {
+      if (critical) status.ready = false;
       if (fix && fixFn) {
         try {
           const result = await fixFn();
           console.log(`  ✓  ${name}: ${result}`);
           fixed++;
+          if (name === 'Chrome CDP endpoint') { status.chrome = true; status.ready = !status.actions.some(a => a.includes('extension')); }
+          if (name === 'Neo extension service worker') { status.extension = true; status.ready = status.chrome; }
         } catch (fixErr) {
           console.log(`  ✗  ${name}: ${fixErr.message}`);
+          if (name === 'Chrome CDP endpoint') {
+            status.actions.push('Chrome CDP not reachable. Run: neo start');
+          } else if (name === 'Neo extension service worker') {
+            status.actions.push(`Neo extension not found in Chrome. Ask user to install: open chrome://extensions → Developer Mode → Load Unpacked → select ${NEO_HOME_DIR}/extension`);
+          }
         }
       } else {
         console.log(`  ✗  ${name}: ${err.message}${fixFn ? ' (use --fix to auto-repair)' : ''}`);
+        if (name === 'Chrome CDP endpoint') {
+          status.actions.push('Chrome CDP not reachable. Run: neo start');
+        } else if (name === 'Neo extension service worker') {
+          status.actions.push(`Neo extension not found in Chrome. Ask user to install: open chrome://extensions → Developer Mode → Load Unpacked → select ${NEO_HOME_DIR}/extension`);
+        }
       }
     }
   }
   if (fix && fixed > 0) console.log(`\n  Fixed ${fixed} issue(s).`);
+  // Recompute ready: both chrome and extension must be true
+  status.ready = status.chrome && status.extension;
+  console.log(`\nNEO_STATUS: ${JSON.stringify(status)}`);
 };
 
 async function main() {
