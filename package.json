@@ -4,7 +4,7 @@
   "description": "Turn any website into an AI-callable API. Passive traffic capture, API schema generation, and execution.",
   "type": "module",
   "scripts": {
-    "build": "NEO_ENTRY=background vite build && NEO_ENTRY=content vite build && NEO_ENTRY=inject vite build",
+    "build": "cross-env NEO_ENTRY=background vite build && cross-env NEO_ENTRY=content vite build && cross-env NEO_ENTRY=inject vite build",
     "test": "node tools/neo.test.cjs"
   },
   "bin": {
@@ -39,6 +39,7 @@
   "devDependencies": {
     "@types/chrome": "^0.0.303",
     "@types/node": "^22.10.5",
+    "cross-env": "^10.1.0",
     "dexie": "^4.0.11",
     "typescript": "^5.8.2",
     "vite": "^6.0.0"
