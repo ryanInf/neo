@@ -36,6 +36,13 @@ Run `neo-schema` on a domain to auto-generate its API map: endpoints, required a
 
 Run API calls inside the browser tab's context via Chrome DevTools Protocol. Cookies, CSRF tokens, session auth — all inherited automatically. No token management needed.
 
+## Supported Browsers
+
+| Browser | Type | Best for |
+|---------|------|----------|
+| **Chrome / Chromium** | Full browser | API capture + UI automation (default) |
+| **[Lightpanda](https://github.com/lightpanda-io/browser)** | Headless (Zig) | AI agents, scraping — 11x faster, 9x less memory |
+
 ## Quick Start
 
 ```bash
@@ -49,6 +56,23 @@ Load the extension:
 2. Enable "Developer mode"
 3. Click "Load unpacked" → select `extension/dist/`
 4. Browse any website — Neo starts capturing immediately
+
+### Lightpanda (headless, no extension needed)
+
+```bash
+# Install Lightpanda
+curl -L -o lightpanda https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux
+chmod +x lightpanda && sudo mv lightpanda /usr/local/bin/
+
+# Configure Neo to use Lightpanda
+# In ~/.neo/config.json:
+# { "chromePath": "/usr/local/bin/lightpanda", "browserType": "lightpanda", "cdpPort": 9222 }
+
+neo start    # launches Lightpanda CDP server
+neo connect  # attach to it
+neo open https://example.com
+neo snapshot # full a11y tree
+```
 
 ## CLI Tools
 
