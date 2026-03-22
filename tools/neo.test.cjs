@@ -597,6 +597,47 @@ function axValueToString(value) {
   return '';
 }
 
+function normalizeRefKey(ref) {
+  const raw = String(ref === undefined || ref === null ? '' : ref).trim();
+  if (!raw) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+
+  let value = raw;
+  const legacyMatch = value.match(/^@e(.+)$/i);
+  if (legacyMatch) value = legacyMatch[1].trim();
+  const bracketMatch = value.match(/^\[(.+)\]$/);
+  if (bracketMatch) value = bracketMatch[1].trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+
+  return String(parseInt(value, 10));
+}
+
+function getRefEntry(session, ref) {
+  const normalizedRef = normalizeRefKey(ref);
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const candidates = [normalizedRef, `@e${normalizedRef}`];
+  for (const key of candidates) {
+    const value = refs[key];
+    if (value && typeof value === 'object') {
+      return { normalizedRef, key, value };
+    }
+  }
+  return { normalizedRef, key: normalizedRef, value: null };
+}
+
+function hasStoredRef(session, ref) {
+  try {
+    return !!getRefEntry(session, ref).value;
+  } catch {
+    return false;
+  }
+}
+
 function assignRefs(axTreeNodes) {
   const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
   const nodeById = new Map();
@@ -621,14 +662,14 @@ function assignRefs(axTreeNodes) {
   const visited = new Set();
   const nodes = [];
   const refs = {};
-  let nextRef = 1;
+  let nextRef = 0;
 
   function visit(node, depth) {
     if (!node || typeof node !== 'object') return;
     if (visited.has(node)) return;
     visited.add(node);
 
-    const ref = `@e${nextRef++}`;
+    const ref = String(nextRef++);
     const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
     const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
     const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
@@ -657,29 +698,38 @@ function formatSnapshot(nodes) {
     if (!node || typeof node !== 'object') continue;
     const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
     const indent = '  '.repeat(depth);
-    const ref = String(node.ref || '@e?');
+    let ref = '?';
+    try {
+      ref = normalizeRefKey(node.ref);
+    } catch {
+      const raw = String(node && node.ref !== undefined && node.ref !== null ? node.ref : '').trim();
+      ref = raw || '?';
+    }
     const role = String(node.role || 'unknown');
     const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
-    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+    rows.push(`${indent}[${ref}] ${role} "${name}"`);
   }
   return rows.join('\n');
 }
 
 function getBackendNodeIdFromRef(session, ref) {
-  const normalizedRef = String(ref || '');
-  if (!normalizedRef.startsWith('@')) {
-    throw new Error(`Invalid ref: ${ref}`);
-  }
-  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
-    ? session.refs
-    : {};
-  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
-    ? refs[normalizedRef].backendDOMNodeId
+  const entry = getRefEntry(session, ref);
+  const backendDOMNodeId = entry.value && Number.isInteger(entry.value.backendDOMNodeId)
+    ? entry.value.backendDOMNodeId
     : null;
   if (!backendDOMNodeId) {
-    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+    throw new Error(`Unknown ref: ${entry.normalizedRef}. Run neo snapshot first`);
   }
   return backendDOMNodeId;
+}
+
+function getActivePageSession(sessionName = DEFAULT_SESSION_NAME, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const session = getSessionFn(sessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    throw new Error('Run neo connect [port] first');
+  }
+  return session;
 }
 
 function centerFromQuad(quad) {
@@ -721,6 +771,167 @@ async function resolveRef(sessionName, ref, deps = {}) {
     y: center.y,
     backendDOMNodeId,
   };
+}
+
+function normalizeCookieDomainFilter(domain) {
+  const raw = String(domain || '').trim().toLowerCase();
+  if (!raw) return '';
+  try {
+    const parsed = raw.includes('://') ? new URL(raw) : new URL(`https://${raw}`);
+    return parsed.hostname.toLowerCase().replace(/^\.+/, '');
+  } catch {
+    return raw.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^\.+/, '');
+  }
+}
+
+function buildCookieQueryUrls(domain) {
+  const host = normalizeCookieDomainFilter(domain);
+  if (!host) return null;
+  return [`https://${host}/`, `http://${host}/`];
+}
+
+function cookieMatchesDomain(cookie, domain) {
+  const target = normalizeCookieDomainFilter(domain);
+  if (!target) return true;
+  const cookieDomain = normalizeCookieDomainFilter(cookie && cookie.domain);
+  if (!cookieDomain) return false;
+  return cookieDomain === target
+    || cookieDomain.endsWith(`.${target}`)
+    || target.endsWith(`.${cookieDomain}`);
+}
+
+function normalizeCookieForExport(cookie) {
+  const source = cookie && typeof cookie === 'object' ? cookie : {};
+  const normalized = {
+    name: String(source.name || ''),
+    value: String(source.value || ''),
+    domain: String(source.domain || ''),
+    path: String(source.path || '/'),
+    expires: Number.isFinite(Number(source.expires)) ? Number(source.expires) : -1,
+    httpOnly: !!source.httpOnly,
+    secure: !!source.secure,
+    sameSite: source.sameSite === undefined || source.sameSite === null ? undefined : String(source.sameSite),
+  };
+  if (normalized.sameSite === undefined) delete normalized.sameSite;
+  return normalized;
+}
+
+function serializeCookiesForExport(cookies) {
+  const rows = Array.isArray(cookies) ? cookies.map(normalizeCookieForExport) : [];
+  return JSON.stringify(rows, null, 2);
+}
+
+function parseCookiesImportText(raw) {
+  const parsed = JSON.parse(String(raw || ''));
+  if (!Array.isArray(parsed)) {
+    throw new Error('Cookie import file must contain a JSON array');
+  }
+  return parsed.map((cookie) => {
+    if (!cookie || typeof cookie !== 'object' || Array.isArray(cookie)) {
+      throw new Error('Cookie import entries must be objects');
+    }
+    const normalized = normalizeCookieForExport(cookie);
+    if (!normalized.name) {
+      throw new Error('Cookie import entry is missing name');
+    }
+    if (!normalized.domain) {
+      throw new Error(`Cookie ${normalized.name} is missing domain`);
+    }
+    return normalized;
+  });
+}
+
+function formatCookieValueForDisplay(value, maxLength = 40) {
+  const text = String(value === undefined || value === null ? '' : value);
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 3) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function formatCookieExpires(expires) {
+  const numeric = Number(expires);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 'session';
+  return new Date(numeric * 1000).toISOString();
+}
+
+function formatCookieRow(cookie) {
+  const normalized = normalizeCookieForExport(cookie);
+  return {
+    Domain: normalized.domain,
+    Name: normalized.name,
+    Value: formatCookieValueForDisplay(normalized.value),
+    Expires: formatCookieExpires(normalized.expires),
+    Secure: normalized.secure ? 'yes' : 'no',
+    HttpOnly: normalized.httpOnly ? 'yes' : 'no',
+  };
+}
+
+function renderCookieTable(cookies) {
+  const rows = Array.isArray(cookies) ? cookies.map(formatCookieRow) : [];
+  if (!rows.length) return '(no cookies)';
+
+  const headers = ['Domain', 'Name', 'Value', 'Expires', 'Secure', 'HttpOnly'];
+  const widths = headers.map((header) => Math.max(header.length, ...rows.map(row => String(row[header] || '').length)));
+  const renderLine = (row) => headers
+    .map((header, index) => String(row[header] || '').padEnd(widths[index]))
+    .join('  ')
+    .trimEnd();
+
+  return [
+    renderLine(Object.fromEntries(headers.map(header => [header, header]))),
+    ...rows.map(renderLine),
+  ].join('\n');
+}
+
+async function getCookiesForSession(sessionName = DEFAULT_SESSION_NAME, domain = null, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : async () => ({ cookies: [] });
+  const session = getSessionFn(sessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const params = {};
+  const urls = buildCookieQueryUrls(domain);
+  if (urls && urls.length) params.urls = urls;
+  const result = await sendFn(session.pageWsUrl, 'Network.getCookies', params);
+  const cookies = Array.isArray(result && result.cookies) ? result.cookies : [];
+  return domain ? cookies.filter(cookie => cookieMatchesDomain(cookie, domain)) : cookies;
+}
+
+function buildSetCookieParams(cookie) {
+  const normalized = normalizeCookieForExport(cookie);
+  const params = {
+    name: normalized.name,
+    value: normalized.value,
+    domain: normalized.domain,
+    path: normalized.path || '/',
+    secure: normalized.secure,
+    httpOnly: normalized.httpOnly,
+  };
+  if (normalized.sameSite) params.sameSite = normalized.sameSite;
+  if (Number.isFinite(normalized.expires) && normalized.expires > 0) {
+    params.expires = normalized.expires;
+  }
+  return params;
+}
+
+function buildDeleteCookieParams(cookie) {
+  const source = cookie && typeof cookie === 'object' ? cookie : {};
+  const params = {
+    name: String(source.name || ''),
+    domain: String(source.domain || ''),
+    path: String(source.path || '/'),
+  };
+  if (source.partitionKey !== undefined) params.partitionKey = source.partitionKey;
+  return params;
+}
+
+function looksLikeCookieExportFile(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return false;
+  if (raw.includes(path.sep) || raw.startsWith('./') || raw.startsWith('../')) return true;
+  return /\.json$/i.test(raw);
 }
 
 const PRESS_KEY_MAP = {
@@ -1253,12 +1464,12 @@ test('assignRefs traverses tree in preorder with depth and refs map', () => {
   ];
   const result = assignRefs(tree);
   assert.strictEqual(result.nodes.length, 4);
-  assert.deepStrictEqual(result.nodes.map(n => n.ref), ['@e1', '@e2', '@e3', '@e4']);
+  assert.deepStrictEqual(result.nodes.map(n => n.ref), ['0', '1', '2', '3']);
   assert.deepStrictEqual(result.nodes.map(n => n.depth), [0, 1, 1, 2]);
-  assert.strictEqual(result.refs['@e1'].backendDOMNodeId, 101);
-  assert.strictEqual(result.refs['@e2'].role, 'button');
-  assert.strictEqual(result.refs['@e2'].name, 'Submit');
-  assert.deepStrictEqual(result.refs['@e2'].bounds, { x: 10, y: 20, width: 30, height: 40 });
+  assert.strictEqual(result.refs['0'].backendDOMNodeId, 101);
+  assert.strictEqual(result.refs['1'].role, 'button');
+  assert.strictEqual(result.refs['1'].name, 'Submit');
+  assert.deepStrictEqual(result.refs['1'].bounds, { x: 10, y: 20, width: 30, height: 40 });
 });
 
 test('assignRefs includes disconnected nodes and normalizes missing fields', () => {
@@ -1270,23 +1481,67 @@ test('assignRefs includes disconnected nodes and normalizes missing fields', () 
   assert.strictEqual(result.nodes.length, 3);
   assert.strictEqual(result.nodes[0].role, 'unknown');
   assert.strictEqual(result.nodes[2].role, 'link');
-  assert.strictEqual(result.refs['@e3'].name, 'More');
+  assert.strictEqual(result.refs['2'].name, 'More');
 });
 
 test('formatSnapshot renders indented lines and escapes quotes', () => {
   const text = formatSnapshot([
-    { ref: '@e1', depth: 0, role: 'button', name: 'Save "Now"' },
-    { ref: '@e2', depth: 1, role: 'textbox', name: 'Search' },
+    { ref: '0', depth: 0, role: 'button', name: 'Save "Now"' },
+    { ref: '1', depth: 1, role: 'textbox', name: 'Search' },
   ]);
   assert.strictEqual(
     text,
-    '@e1  [button] "Save \\"Now\\""\n  @e2  [textbox] "Search"'
+    '[0] button "Save \\"Now\\""\n  [1] textbox "Search"'
   );
 });
 
 test('formatSnapshot ignores invalid nodes and falls back to defaults', () => {
   const text = formatSnapshot([null, { depth: -1, name: 'X' }]);
-  assert.strictEqual(text, '@e?  [unknown] "X"');
+  assert.strictEqual(text, '[?] unknown "X"');
+});
+
+test('formatSnapshot normalizes legacy refs for display', () => {
+  const text = formatSnapshot([{ ref: '@e5', depth: 0, role: 'button', name: 'Legacy' }]);
+  assert.strictEqual(text, '[5] button "Legacy"');
+});
+
+test('getBackendNodeIdFromRef accepts compact, bracketed, and legacy refs', () => {
+  const session = {
+    refs: {
+      '5': { backendDOMNodeId: 5005 },
+    },
+  };
+  assert.strictEqual(normalizeRefKey('05'), '5');
+  assert.strictEqual(getBackendNodeIdFromRef(session, '5'), 5005);
+  assert.strictEqual(getBackendNodeIdFromRef(session, '[5]'), 5005);
+  assert.strictEqual(getBackendNodeIdFromRef(session, '@e5'), 5005);
+});
+
+test('hasStoredRef recognizes compact and legacy lookup forms', () => {
+  const session = {
+    refs: {
+      '3': { backendDOMNodeId: 3003 },
+      '@e8': { backendDOMNodeId: 8008 },
+    },
+  };
+  assert.strictEqual(hasStoredRef(session, '3'), true);
+  assert.strictEqual(hasStoredRef(session, '[3]'), true);
+  assert.strictEqual(hasStoredRef(session, '@e8'), true);
+  assert.strictEqual(hasStoredRef(session, '99'), false);
+});
+
+test('getActivePageSession returns the active page session', () => {
+  const session = getActivePageSession('ui', {
+    getSession: () => ({ pageWsUrl: 'ws://page', refs: {} }),
+  });
+  assert.deepStrictEqual(session, { pageWsUrl: 'ws://page', refs: {} });
+});
+
+test('getActivePageSession throws without a page websocket url', () => {
+  assert.throws(
+    () => getActivePageSession('ui', { getSession: () => ({ cdpUrl: 'http://localhost:9222' }) }),
+    /Run neo connect/
+  );
 });
 
 console.log('\nresolveRef:');
@@ -1296,7 +1551,7 @@ test('resolveRef returns objectId + center coordinates', async () => {
     ui: {
       pageWsUrl: 'ws://localhost:9222/devtools/page/1',
       refs: {
-        '@e1': { backendDOMNodeId: 1234 },
+        '1': { backendDOMNodeId: 1234 },
       },
     },
   };
@@ -1311,7 +1566,7 @@ test('resolveRef returns objectId + center coordinates', async () => {
     throw new Error(`Unexpected method: ${method}`);
   };
 
-  const result = await resolveRef('ui', '@e1', {
+  const result = await resolveRef('ui', '1', {
     getSession: (name) => fakeSession[name] || null,
     cdpSend: fakeSend,
   });
@@ -1335,12 +1590,172 @@ test('resolveRef throws when ref is missing from session refs', async () => {
     },
   };
   await assert.rejects(
-    resolveRef('ui', '@e9', {
+    resolveRef('ui', '9', {
       getSession: (name) => fakeSession[name] || null,
       cdpSend: async () => ({}),
     }),
     /Unknown ref/
   );
+});
+
+console.log('\ncookie helpers:');
+test('formatCookieRow truncates values and formats booleans/expires', () => {
+  const row = formatCookieRow({
+    domain: '.example.com',
+    name: 'session',
+    value: 'abcdefghijklmnopqrstuvwxyz1234567890ABCDEFG',
+    expires: 1735689600,
+    secure: true,
+    httpOnly: false,
+  });
+  assert.deepStrictEqual(row, {
+    Domain: '.example.com',
+    Name: 'session',
+    Value: 'abcdefghijklmnopqrstuvwxyz1234567890A...',
+    Expires: '2025-01-01T00:00:00.000Z',
+    Secure: 'yes',
+    HttpOnly: 'no',
+  });
+});
+
+test('cookie import/export round-trip preserves export schema', () => {
+  const cookies = [
+    {
+      name: 'sid',
+      value: 'abc123',
+      domain: '.example.com',
+      path: '/',
+      expires: 1735689600,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+      ignored: 'x',
+    },
+    {
+      name: 'theme',
+      value: 'light',
+      domain: 'app.example.com',
+      path: '/',
+      expires: -1,
+      httpOnly: false,
+      secure: false,
+    },
+  ];
+  const exported = serializeCookiesForExport(cookies);
+  const imported = parseCookiesImportText(exported);
+  assert.deepStrictEqual(imported, [
+    {
+      name: 'sid',
+      value: 'abc123',
+      domain: '.example.com',
+      path: '/',
+      expires: 1735689600,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+    },
+    {
+      name: 'theme',
+      value: 'light',
+      domain: 'app.example.com',
+      path: '/',
+      expires: -1,
+      httpOnly: false,
+      secure: false,
+    },
+  ]);
+});
+
+test('cookie domain helpers normalize hosts and query URLs', () => {
+  assert.strictEqual(normalizeCookieDomainFilter('https://App.Example.com/path'), 'app.example.com');
+  assert.deepStrictEqual(buildCookieQueryUrls('.example.com'), ['https://example.com/', 'http://example.com/']);
+  assert.strictEqual(cookieMatchesDomain({ domain: '.example.com' }, 'app.example.com'), true);
+  assert.strictEqual(cookieMatchesDomain({ domain: 'other.com' }, 'example.com'), false);
+});
+
+test('renderCookieTable includes headers and row values', () => {
+  const text = renderCookieTable([
+    {
+      domain: '.example.com',
+      name: 'sid',
+      value: 'abc123',
+      expires: -1,
+      secure: true,
+      httpOnly: true,
+    },
+  ]);
+  assert(text.includes('Domain'));
+  assert(text.includes('.example.com'));
+  assert(text.includes('sid'));
+  assert(text.includes('session'));
+});
+
+test('getCookiesForSession passes CDP urls filter and post-filters by domain', async () => {
+  const calls = [];
+  const cookies = await getCookiesForSession('ui', 'app.example.com', {
+    getSession: () => ({ pageWsUrl: 'ws://page' }),
+    cdpSend: async (wsUrl, method, params) => {
+      calls.push({ wsUrl, method, params });
+      return {
+        cookies: [
+          { name: 'sid', domain: '.example.com' },
+          { name: 'prefs', domain: 'app.example.com' },
+          { name: 'other', domain: 'other.com' },
+        ],
+      };
+    },
+  });
+  assert.deepStrictEqual(cookies.map(cookie => cookie.name), ['sid', 'prefs']);
+  assert.deepStrictEqual(calls, [{
+    wsUrl: 'ws://page',
+    method: 'Network.getCookies',
+    params: { urls: ['https://app.example.com/', 'http://app.example.com/'] },
+  }]);
+});
+
+test('build cookie CDP params preserve supported fields', () => {
+  assert.deepStrictEqual(
+    buildSetCookieParams({
+      name: 'sid',
+      value: 'abc',
+      domain: '.example.com',
+      path: '/',
+      expires: 1735689600,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Strict',
+    }),
+    {
+      name: 'sid',
+      value: 'abc',
+      domain: '.example.com',
+      path: '/',
+      secure: true,
+      httpOnly: true,
+      sameSite: 'Strict',
+      expires: 1735689600,
+    }
+  );
+  assert.deepStrictEqual(
+    buildDeleteCookieParams({
+      name: 'sid',
+      domain: '.example.com',
+      path: '/',
+      partitionKey: { topLevelSite: 'https://example.com', hasCrossSiteAncestor: false },
+    }),
+    {
+      name: 'sid',
+      domain: '.example.com',
+      path: '/',
+      partitionKey: { topLevelSite: 'https://example.com', hasCrossSiteAncestor: false },
+    }
+  );
+});
+
+test('looksLikeCookieExportFile detects file-like arguments', () => {
+  assert.strictEqual(looksLikeCookieExportFile('cookies.json'), true);
+  assert.strictEqual(looksLikeCookieExportFile('./cookies.txt'), true);
+  assert.strictEqual(looksLikeCookieExportFile('example.com'), false);
 });
 
 console.log('\npress key mapping:');
@@ -2173,12 +2588,12 @@ test('parseSnapshotArgs defaults diff to false', () => {
 console.log('\nsnapshot diff logic:');
 test('diff detects added and removed nodes', () => {
   const prev = [
-    { ref: '@e1', role: 'button', name: 'Save', depth: 0 },
-    { ref: '@e2', role: 'link', name: 'Home', depth: 0 },
+    { ref: '0', role: 'button', name: 'Save', depth: 0 },
+    { ref: '1', role: 'link', name: 'Home', depth: 0 },
   ];
   const curr = [
-    { ref: '@e1', role: 'button', name: 'Save', depth: 0 },
-    { ref: '@e3', role: 'textbox', name: 'Search', depth: 1 },
+    { ref: '0', role: 'button', name: 'Save', depth: 0 },
+    { ref: '2', role: 'textbox', name: 'Search', depth: 1 },
   ];
   const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
   const currMap = new Map(curr.map(n => [`${n.role}:${n.name}`, n]));
@@ -2192,10 +2607,10 @@ test('diff detects added and removed nodes', () => {
 
 test('diff detects changed depth', () => {
   const prev = [
-    { ref: '@e1', role: 'button', name: 'Submit', depth: 0 },
+    { ref: '0', role: 'button', name: 'Submit', depth: 0 },
   ];
   const curr = [
-    { ref: '@e1', role: 'button', name: 'Submit', depth: 2 },
+    { ref: '0', role: 'button', name: 'Submit', depth: 2 },
   ];
   const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
   const changed = curr.filter(n => {
@@ -2208,10 +2623,10 @@ test('diff detects changed depth', () => {
 
 test('diff reports no changes for identical snapshots', () => {
   const prev = [
-    { ref: '@e1', role: 'button', name: 'OK', depth: 0 },
+    { ref: '0', role: 'button', name: 'OK', depth: 0 },
   ];
   const curr = [
-    { ref: '@e1', role: 'button', name: 'OK', depth: 0 },
+    { ref: '0', role: 'button', name: 'OK', depth: 0 },
   ];
   const prevMap = new Map(prev.map(n => [`${n.role}:${n.name}`, n]));
   const currMap = new Map(curr.map(n => [`${n.role}:${n.name}`, n]));

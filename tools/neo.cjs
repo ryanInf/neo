@@ -33,17 +33,21 @@
 //   neo tab                                 List CDP targets in the active session
 //   neo tab <index> | neo tab --url <pat>  Switch active tab target
 //   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
-//   neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with @ref mapping
-//   neo click @ref [--new-tab]              Click element by @ref
-//   neo fill @ref "text"                     Clear then fill element by @ref
-//   neo type @ref "text"                     Type text without clearing
+//   neo cookies list [domain]               List cookies for the active CDP session
+//   neo cookies export [domain] [file]      Export cookies as JSON
+//   neo cookies import <file>               Import cookies from JSON file
+//   neo cookies clear [domain]              Clear cookies
+//   neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with compact ref mapping
+//   neo click <ref> [--new-tab]             Click element by ref
+//   neo fill <ref> "text"                    Clear then fill element by ref
+//   neo type <ref> "text"                    Type text without clearing
 //   neo press <key>                          Press keyboard key (supports Ctrl+a)
-//   neo hover @ref                           Hover over element by @ref
+//   neo hover <ref>                          Hover over element by ref
 //   neo scroll <dir> [px] [--selector css]  Scroll by direction and distance
-//   neo select @ref "value"                  Select option value by @ref
+//   neo select <ref> "value"                 Select option value by ref
 //   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
-//   neo get text @ref | neo get url | neo get title  Extract page/element info
-//   neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
+//   neo get text <ref> | neo get url | neo get title Extract page/element info
+//   neo wait <ref> | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
 //   neo bridge [port] [--json] [--quiet]    Start WebSocket bridge for real-time capture streaming
 //   neo label <domain> [--dry-run]          Semantic endpoint labeling (heuristics + optional LLM JSON)
 //   neo workflow discover <domain>           Discover multi-step workflows from dependencies
@@ -1314,6 +1318,56 @@ function axValueToString(value) {
   return '';
 }
 
+function normalizeRefKey(ref) {
+  const raw = String(ref === undefined || ref === null ? '' : ref).trim();
+  if (!raw) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+
+  let value = raw;
+  const legacyMatch = value.match(/^@e(.+)$/i);
+  if (legacyMatch) value = legacyMatch[1].trim();
+  const bracketMatch = value.match(/^\[(.+)\]$/);
+  if (bracketMatch) value = bracketMatch[1].trim();
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid ref: ${ref}`);
+  }
+
+  return String(parseInt(value, 10));
+}
+
+function getRefEntry(session, ref) {
+  const normalizedRef = normalizeRefKey(ref);
+  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
+    ? session.refs
+    : {};
+  const candidates = [normalizedRef, `@e${normalizedRef}`];
+  for (const key of candidates) {
+    const value = refs[key];
+    if (value && typeof value === 'object') {
+      return { normalizedRef, key, value };
+    }
+  }
+  return { normalizedRef, key: normalizedRef, value: null };
+}
+
+function hasStoredRef(session, ref) {
+  try {
+    return !!getRefEntry(session, ref).value;
+  } catch {
+    return false;
+  }
+}
+
+function formatDisplayRef(ref) {
+  try {
+    return normalizeRefKey(ref);
+  } catch {
+    const raw = String(ref === undefined || ref === null ? '' : ref).trim();
+    return raw || '?';
+  }
+}
+
 function assignRefs(axTreeNodes) {
   const sourceNodes = Array.isArray(axTreeNodes) ? axTreeNodes.filter(node => node && typeof node === 'object') : [];
   const nodeById = new Map();
@@ -1338,14 +1392,14 @@ function assignRefs(axTreeNodes) {
   const visited = new Set();
   const nodes = [];
   const refs = {};
-  let nextRef = 1;
+  let nextRef = 0;
 
   function visit(node, depth) {
     if (!node || typeof node !== 'object') return;
     if (visited.has(node)) return;
     visited.add(node);
 
-    const ref = `@e${nextRef++}`;
+    const ref = String(nextRef++);
     const role = axValueToString(node.role).trim().toLowerCase() || 'unknown';
     const name = axValueToString(node.name).replace(/\s+/g, ' ').trim();
     const backendDOMNodeId = Number.isInteger(node.backendDOMNodeId) ? node.backendDOMNodeId : null;
@@ -1374,35 +1428,33 @@ function formatSnapshot(nodes) {
     if (!node || typeof node !== 'object') continue;
     const depth = Number.isInteger(node.depth) && node.depth > 0 ? node.depth : 0;
     const indent = '  '.repeat(depth);
-    const ref = String(node.ref || '@e?');
+    const ref = formatDisplayRef(node.ref);
     const role = String(node.role || 'unknown');
     const name = String(node.name || '').replace(/\s+/g, ' ').trim().replace(/"/g, '\\"');
-    rows.push(`${indent}${ref}  [${role}] "${name}"`);
+    rows.push(`${indent}[${ref}] ${role} "${name}"`);
   }
   return rows.join('\n');
 }
 
-function getSessionPageWsUrl(sessionName = DEFAULT_SESSION_NAME) {
+function getActivePageSession(sessionName = DEFAULT_SESSION_NAME) {
   const session = getSession(sessionName);
-  if (!session || !session.pageWsUrl) {
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
     throw new Error('Run neo connect [port] first');
   }
-  return session.pageWsUrl;
+  return session;
+}
+
+function getSessionPageWsUrl(sessionName = DEFAULT_SESSION_NAME) {
+  return getActivePageSession(sessionName).pageWsUrl;
 }
 
 function getBackendNodeIdFromRef(session, ref) {
-  const normalizedRef = String(ref || '');
-  if (!normalizedRef.startsWith('@')) {
-    throw new Error(`Invalid ref: ${ref}`);
-  }
-  const refs = session && typeof session === 'object' && session.refs && typeof session.refs === 'object'
-    ? session.refs
-    : {};
-  const backendDOMNodeId = refs[normalizedRef] && Number.isInteger(refs[normalizedRef].backendDOMNodeId)
-    ? refs[normalizedRef].backendDOMNodeId
+  const entry = getRefEntry(session, ref);
+  const backendDOMNodeId = entry.value && Number.isInteger(entry.value.backendDOMNodeId)
+    ? entry.value.backendDOMNodeId
     : null;
   if (!backendDOMNodeId) {
-    throw new Error(`Unknown ref: ${normalizedRef}. Run neo snapshot first`);
+    throw new Error(`Unknown ref: ${entry.normalizedRef}. Run neo snapshot first`);
   }
   return backendDOMNodeId;
 }
@@ -1604,6 +1656,168 @@ async function waitForSelector(pageWsUrl, selector, timeoutMs = 10000, intervalM
     await sleep(intervalMs);
   }
   return false;
+}
+
+function normalizeCookieDomainFilter(domain) {
+  const raw = String(domain || '').trim().toLowerCase();
+  if (!raw) return '';
+  try {
+    const parsed = raw.includes('://') ? new URL(raw) : new URL(`https://${raw}`);
+    return parsed.hostname.toLowerCase().replace(/^\.+/, '');
+  } catch {
+    return raw.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^\.+/, '');
+  }
+}
+
+function buildCookieQueryUrls(domain) {
+  const host = normalizeCookieDomainFilter(domain);
+  if (!host) return null;
+  return [`https://${host}/`, `http://${host}/`];
+}
+
+function cookieMatchesDomain(cookie, domain) {
+  const target = normalizeCookieDomainFilter(domain);
+  if (!target) return true;
+  const cookieDomain = normalizeCookieDomainFilter(cookie && cookie.domain);
+  if (!cookieDomain) return false;
+  return cookieDomain === target
+    || cookieDomain.endsWith(`.${target}`)
+    || target.endsWith(`.${cookieDomain}`);
+}
+
+function normalizeCookieForExport(cookie) {
+  const source = cookie && typeof cookie === 'object' ? cookie : {};
+  const normalized = {
+    name: String(source.name || ''),
+    value: String(source.value || ''),
+    domain: String(source.domain || ''),
+    path: String(source.path || '/'),
+    expires: Number.isFinite(Number(source.expires)) ? Number(source.expires) : -1,
+    httpOnly: !!source.httpOnly,
+    secure: !!source.secure,
+    sameSite: source.sameSite === undefined || source.sameSite === null ? undefined : String(source.sameSite),
+  };
+  if (normalized.sameSite === undefined) delete normalized.sameSite;
+  return normalized;
+}
+
+function serializeCookiesForExport(cookies) {
+  const rows = Array.isArray(cookies) ? cookies.map(normalizeCookieForExport) : [];
+  return JSON.stringify(rows, null, 2);
+}
+
+function parseCookiesImportText(raw) {
+  const parsed = JSON.parse(String(raw || ''));
+  if (!Array.isArray(parsed)) {
+    throw new Error('Cookie import file must contain a JSON array');
+  }
+  return parsed.map((cookie) => {
+    if (!cookie || typeof cookie !== 'object' || Array.isArray(cookie)) {
+      throw new Error('Cookie import entries must be objects');
+    }
+    const normalized = normalizeCookieForExport(cookie);
+    if (!normalized.name) {
+      throw new Error('Cookie import entry is missing name');
+    }
+    if (!normalized.domain) {
+      throw new Error(`Cookie ${normalized.name} is missing domain`);
+    }
+    return normalized;
+  });
+}
+
+function formatCookieValueForDisplay(value, maxLength = 40) {
+  const text = String(value === undefined || value === null ? '' : value);
+  if (text.length <= maxLength) return text;
+  if (maxLength <= 3) return text.slice(0, maxLength);
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function formatCookieExpires(expires) {
+  const numeric = Number(expires);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 'session';
+  return new Date(numeric * 1000).toISOString();
+}
+
+function formatCookieRow(cookie) {
+  const normalized = normalizeCookieForExport(cookie);
+  return {
+    Domain: normalized.domain,
+    Name: normalized.name,
+    Value: formatCookieValueForDisplay(normalized.value),
+    Expires: formatCookieExpires(normalized.expires),
+    Secure: normalized.secure ? 'yes' : 'no',
+    HttpOnly: normalized.httpOnly ? 'yes' : 'no',
+  };
+}
+
+function renderCookieTable(cookies) {
+  const rows = Array.isArray(cookies) ? cookies.map(formatCookieRow) : [];
+  if (!rows.length) return '(no cookies)';
+
+  const headers = ['Domain', 'Name', 'Value', 'Expires', 'Secure', 'HttpOnly'];
+  const widths = headers.map((header) => Math.max(header.length, ...rows.map(row => String(row[header] || '').length)));
+  const renderLine = (row) => headers
+    .map((header, index) => String(row[header] || '').padEnd(widths[index]))
+    .join('  ')
+    .trimEnd();
+
+  return [
+    renderLine(Object.fromEntries(headers.map(header => [header, header]))),
+    ...rows.map(renderLine),
+  ].join('\n');
+}
+
+async function getCookiesForSession(sessionName = DEFAULT_SESSION_NAME, domain = null, deps = {}) {
+  const getSessionFn = typeof deps.getSession === 'function' ? deps.getSession : getSession;
+  const sendFn = typeof deps.cdpSend === 'function' ? deps.cdpSend : cdpSend;
+  const normalizedSessionName = sessionName || DEFAULT_SESSION_NAME;
+  const session = getSessionFn(normalizedSessionName);
+  if (!session || typeof session.pageWsUrl !== 'string' || !session.pageWsUrl.trim()) {
+    throw new Error('Run neo connect [port] first');
+  }
+
+  const params = {};
+  const urls = buildCookieQueryUrls(domain);
+  if (urls && urls.length) params.urls = urls;
+  const result = await sendFn(session.pageWsUrl, 'Network.getCookies', params);
+  const cookies = Array.isArray(result && result.cookies) ? result.cookies : [];
+  return domain ? cookies.filter(cookie => cookieMatchesDomain(cookie, domain)) : cookies;
+}
+
+function buildSetCookieParams(cookie) {
+  const normalized = normalizeCookieForExport(cookie);
+  const params = {
+    name: normalized.name,
+    value: normalized.value,
+    domain: normalized.domain,
+    path: normalized.path || '/',
+    secure: normalized.secure,
+    httpOnly: normalized.httpOnly,
+  };
+  if (normalized.sameSite) params.sameSite = normalized.sameSite;
+  if (Number.isFinite(normalized.expires) && normalized.expires > 0) {
+    params.expires = normalized.expires;
+  }
+  return params;
+}
+
+function buildDeleteCookieParams(cookie) {
+  const source = cookie && typeof cookie === 'object' ? cookie : {};
+  const params = {
+    name: String(source.name || ''),
+    domain: String(source.domain || ''),
+    path: String(source.path || '/'),
+  };
+  if (source.partitionKey !== undefined) params.partitionKey = source.partitionKey;
+  return params;
+}
+
+function looksLikeCookieExportFile(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return false;
+  if (raw.includes(path.sep) || raw.startsWith('./') || raw.startsWith('../')) return true;
+  return /\.json$/i.test(raw);
 }
 
 function dbEval(body) {
@@ -4102,6 +4316,125 @@ commands.inject = async function(args, context = {}) {
   console.log(`Injected Neo capture script${persisted}`);
 };
 
+// neo cookies <action>
+commands.cookies = async function(args, context = {}) {
+  const { positional } = parseArgs(args || []);
+  const action = positional[0];
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  let session;
+
+  try {
+    session = getActivePageSession(sessionName);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+
+  switch (action) {
+    case 'list': {
+      if (positional.length > 2) {
+        console.error('Usage: neo cookies list [domain]');
+        process.exit(1);
+      }
+      const domain = positional[1] || null;
+      const cookies = await getCookiesForSession(sessionName, domain);
+      console.log(renderCookieTable(cookies));
+      return;
+    }
+
+    case 'export': {
+      if (positional.length > 3) {
+        console.error('Usage: neo cookies export [domain] [file]');
+        process.exit(1);
+      }
+
+      let domain = null;
+      let outputFile = null;
+      if (positional.length === 2) {
+        if (looksLikeCookieExportFile(positional[1])) outputFile = positional[1];
+        else domain = positional[1];
+      } else if (positional.length === 3) {
+        domain = positional[1];
+        outputFile = positional[2];
+      }
+
+      const cookies = await getCookiesForSession(sessionName, domain);
+      const payload = serializeCookiesForExport(cookies);
+      if (!outputFile) {
+        console.log(payload);
+        return;
+      }
+
+      const resolvedPath = path.resolve(outputFile);
+      ensureParentDirectory(resolvedPath);
+      fs.writeFileSync(resolvedPath, `${payload}\n`, 'utf8');
+      console.log(resolvedPath);
+      return;
+    }
+
+    case 'import': {
+      const file = positional[1];
+      if (!file || positional.length !== 2) {
+        console.error('Usage: neo cookies import <file>');
+        process.exit(1);
+      }
+
+      const resolvedPath = path.resolve(file);
+      if (!fs.existsSync(resolvedPath)) {
+        console.error(`File not found: ${resolvedPath}`);
+        process.exit(1);
+      }
+
+      const cookies = parseCookiesImportText(fs.readFileSync(resolvedPath, 'utf8'));
+      let imported = 0;
+      const failed = [];
+      for (const cookie of cookies) {
+        const result = await cdpSend(session.pageWsUrl, 'Network.setCookie', buildSetCookieParams(cookie));
+        if (result && result.success === false) {
+          failed.push(cookie.name || '(unnamed)');
+          continue;
+        }
+        imported++;
+      }
+
+      if (failed.length > 0) {
+        throw new Error(`Imported ${imported}/${cookies.length} cookies. Failed: ${failed.join(', ')}`);
+      }
+
+      console.log(`Imported ${imported} cookies from ${resolvedPath}`);
+      return;
+    }
+
+    case 'clear': {
+      if (positional.length > 2) {
+        console.error('Usage: neo cookies clear [domain]');
+        process.exit(1);
+      }
+
+      const domain = positional[1] || null;
+      if (!domain) {
+        await cdpSend(session.pageWsUrl, 'Storage.clearCookies');
+        console.log('Cleared all cookies');
+        return;
+      }
+
+      const cookies = await getCookiesForSession(sessionName, domain);
+      for (const cookie of cookies) {
+        await cdpSend(session.pageWsUrl, 'Network.deleteCookies', buildDeleteCookieParams(cookie));
+      }
+      console.log(`Cleared ${cookies.length} cookies for ${normalizeCookieDomainFilter(domain) || String(domain)}`);
+      return;
+    }
+
+    default:
+      console.error('Usage: neo cookies list [domain]');
+      console.error('       neo cookies export [domain] [file]');
+      console.error('       neo cookies import <file>');
+      console.error('       neo cookies clear [domain]');
+      process.exit(1);
+  }
+};
+
 // neo snapshot [-i] [-C] [--json] [--diff] [--selector css]
 commands.snapshot = async function(args, context = {}) {
   const { options, unknown } = parseSnapshotArgs(args || []);
@@ -4172,10 +4505,7 @@ commands.snapshot = async function(args, context = {}) {
     }
     if (removed.length) {
       lines.push(`- Removed (${removed.length}):`);
-      for (const node of removed) {
-        const indent = '  '.repeat(node.depth || 0);
-        lines.push(`  ${indent}${node.ref}  [${node.role}] "${node.name}"`);
-      }
+      lines.push(formatSnapshot(removed));
     }
     if (changed.length) {
       lines.push(`~ Changed (${changed.length}):`);
@@ -4214,12 +4544,12 @@ commands.snapshot = async function(args, context = {}) {
   console.log(output || '(empty snapshot)');
 };
 
-// neo click @ref [--new-tab]
+// neo click <ref> [--new-tab]
 commands.click = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args || []);
   const ref = positional[0];
   if (!ref || positional.length > 1) {
-    console.error('Usage: neo click @ref [--new-tab]');
+    console.error('Usage: neo click <ref> [--new-tab]');
     process.exit(1);
   }
 
@@ -4246,13 +4576,13 @@ commands.click = async function(args, context = {}) {
   console.log(`Clicked ${ref}`);
 };
 
-// neo fill @ref "text"
+// neo fill <ref> "text"
 commands.fill = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
   const ref = positional[0];
   const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
   if (!ref || text === null) {
-    console.error('Usage: neo fill @ref "text"');
+    console.error('Usage: neo fill <ref> "text"');
     process.exit(1);
   }
 
@@ -4289,13 +4619,13 @@ commands.fill = async function(args, context = {}) {
   console.log(`Filled ${ref}`);
 };
 
-// neo type @ref "text"
+// neo type <ref> "text"
 commands.type = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
   const ref = positional[0];
   const text = positional.length > 1 ? positional.slice(1).join(' ') : null;
   if (!ref || text === null) {
-    console.error('Usage: neo type @ref "text"');
+    console.error('Usage: neo type <ref> "text"');
     process.exit(1);
   }
 
@@ -4347,12 +4677,12 @@ commands.press = async function(args, context = {}) {
   console.log(`Pressed ${rawKey}`);
 };
 
-// neo hover @ref
+// neo hover <ref>
 commands.hover = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
   const ref = positional[0];
   if (!ref || positional.length > 1) {
-    console.error('Usage: neo hover @ref');
+    console.error('Usage: neo hover <ref>');
     process.exit(1);
   }
 
@@ -4398,13 +4728,13 @@ commands.scroll = async function(args, context = {}) {
   console.log(`Scrolled ${direction} ${distance}px`);
 };
 
-// neo select @ref "value"
+// neo select <ref> "value"
 commands.select = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
   const ref = positional[0];
   const value = positional.length > 1 ? positional.slice(1).join(' ') : null;
   if (!ref || value === null) {
-    console.error('Usage: neo select @ref "value"');
+    console.error('Usage: neo select <ref> "value"');
     process.exit(1);
   }
 
@@ -4484,12 +4814,12 @@ commands.screenshot = async function(args, context = {}) {
   console.log(outputPath);
 };
 
-// neo get text @ref | neo get url | neo get title
+// neo get text <ref> | neo get url | neo get title
 commands.get = async function(args, context = {}) {
   const { positional } = parseArgs(args || []);
   const subject = positional[0];
   if (!subject) {
-    console.error('Usage: neo get text @ref | neo get url | neo get title');
+    console.error('Usage: neo get text <ref> | neo get url | neo get title');
     process.exit(1);
   }
 
@@ -4499,7 +4829,7 @@ commands.get = async function(args, context = {}) {
   if (subject === 'text') {
     const ref = positional[1];
     if (!ref || positional.length > 2) {
-      console.error('Usage: neo get text @ref');
+      console.error('Usage: neo get text <ref>');
       process.exit(1);
     }
     const target = await resolveRef(sessionName, ref);
@@ -4533,11 +4863,11 @@ commands.get = async function(args, context = {}) {
     return;
   }
 
-  console.error('Usage: neo get text @ref | neo get url | neo get title');
+  console.error('Usage: neo get text <ref> | neo get url | neo get title');
   process.exit(1);
 };
 
-// neo wait @ref | neo wait --load networkidle | neo wait <ms>
+// neo wait <ref> | neo wait --load networkidle | neo wait <ms>
 commands.wait = async function(args, context = {}) {
   const { positional, flags } = parseArgs(args || []);
 
@@ -4553,12 +4883,16 @@ commands.wait = async function(args, context = {}) {
 
   const target = positional[0];
   if (!target || positional.length > 1) {
-    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    console.error('Usage: neo wait <ref> | neo wait --load networkidle | neo wait <ms>');
     process.exit(1);
   }
 
-  if (target.startsWith('@')) {
-    const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const sessionName = context.sessionName || DEFAULT_SESSION_NAME;
+  const session = getSession(sessionName);
+  const rawTarget = String(target).trim();
+  const shouldResolveRef = rawTarget.startsWith('@') || rawTarget.startsWith('[') || hasStoredRef(session, rawTarget);
+
+  if (shouldResolveRef) {
     const pageWsUrl = getSessionPageWsUrl(sessionName);
     const resolved = await resolveRef(sessionName, target);
     const selector = await selectorFromObject(pageWsUrl, resolved.objectId);
@@ -4576,7 +4910,7 @@ commands.wait = async function(args, context = {}) {
 
   const ms = parseInt(target, 10);
   if (!Number.isInteger(ms) || ms < 0) {
-    console.error('Usage: neo wait @ref | neo wait --load networkidle | neo wait <ms>');
+    console.error('Usage: neo wait <ref> | neo wait --load networkidle | neo wait <ms>');
     process.exit(1);
   }
   await sleep(ms);
@@ -7168,17 +7502,18 @@ Commands:
   neo tab                                 List CDP targets in the active session
   neo tab <index> | neo tab --url <pat>  Switch active tab target
   neo inject [--persist] [--tab pattern]  Inject Neo capture script into page target
-  neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with @ref mapping
-  neo click @ref [--new-tab]              Click element by @ref
-  neo fill @ref "text"                     Clear then fill element by @ref
-  neo type @ref "text"                     Type text without clearing
+  neo cookies list|export|import|clear     Manage browser cookies in the active session
+  neo snapshot [-i] [-C] [--json] [--diff] Snapshot a11y tree with compact refs
+  neo click <ref> [--new-tab]             Click element by ref
+  neo fill <ref> "text"                    Clear then fill element by ref
+  neo type <ref> "text"                    Type text without clearing
   neo press <key>                          Press keyboard key (supports Ctrl+a)
-  neo hover @ref                           Hover over element by @ref
+  neo hover <ref>                          Hover over element by ref
   neo scroll <dir> [px] [--selector css]   Scroll by direction and distance
-  neo select @ref "value"                  Select option value by @ref
+  neo select <ref> "value"                 Select option value by ref
   neo screenshot [path] [--full] [--annotate] Capture screenshot to file
-  neo get text @ref | neo get url | neo get title  Extract page/element info
-  neo wait @ref | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
+  neo get text <ref> | neo get url | neo get title Extract page/element info
+  neo wait <ref> | neo wait --load networkidle | neo wait <ms> Wait for UI/load/time
   neo label <domain> [--dry-run]          Add semantic labels to schema endpoints
   neo workflow discover|show|run <name>    Discover and replay multi-step endpoint workflows
   neo tabs [filter]                       List open Chrome tabs
